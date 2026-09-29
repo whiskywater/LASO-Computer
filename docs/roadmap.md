@@ -11,12 +11,12 @@ This list separates implemented Windows behavior from blocked integrations. Buil
 - Win32 screen capture, pointer and keyboard input, Unicode clipboard, visible window list/focus.
 - Bounded Windows UI Automation tree inspection and uniquely matched control invocation/value setting.
 - Direct restricted process execution with exact allowlist, explicit environment, bounded output, timeout/cancellation.
-- Playwright MCP adapter design and fail-closed AppContainer launch. Browser actions are unavailable at present.
+- Playwright MCP adapter with bounded JSONL transport, exact tool allowlist, AppContainer/Job Object, per-run ACL-scoped temp/profile, and a real browser startup probe. Browser actions are unavailable at present.
 
 ## Blocked acceptance items
 
 1. **LASO worker integration:** The inspected public LASO `main` commit `ef072429c96eb9b0964e56a561591a37ccb68fbd` did not contain a worker-process v1 contract or approval/request framing. The worker's protocol unit tests are not a substitute for integration. Repeat startup, submit, polling, failures, cancellation, endpoint policy, approval, and malformed/oversized frame acceptance after LASO publishes the contract.
-2. **Playwright:** The AppContainer blocks Node's attempt to inspect the `C:\` volume root. The adapter remains unavailable; no browser operation is validated. Resolve this without broadening filesystem access, then run launch/navigation/snapshot/query/click/fill/tabs/screenshot/timeout/cancel/crash/malformed-output tests.
+2. **Playwright:** Node's main-module `lstat('C:\\')` probe was avoided with `--preserve-symlinks-main`, without granting access to the volume root. The MCP initialize/tools handshake succeeds, but the first browser operation stalls synchronously while Node creates Edge with `--remote-debugging-pipe`; the 10-second startup probe times out and the adapter remains unavailable. A minimal Edge `--no-sandbox` probe did not establish a working MCP browser and that weakening flag is not retained. See [the investigation](playwright-provider.md). Resolve the child-process launch issue without broadening filesystem access, then run the full browser operation, denial, cancellation, crash, and cleanup lane.
 3. **Desktop automation stability:** The purpose-built interactive fixture has passed once but a later rerun intermittently failed to deliver keyboard text into the fixture control. Investigate foreground focus behavior and rerun repeatedly before calling keyboard input reliable.
 4. **Endpoint approvals:** No unsolicited request frame is sent. `require_approval` fails closed until a documented and proven correlated exchange is supported.
 5. **Remote endpoint:** No authenticated remote connection, enrollment, leases, reconnect, endpoint targeting, or server-mediated revocation. LASO must spawn the worker locally.

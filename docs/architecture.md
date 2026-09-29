@@ -32,7 +32,7 @@ Providers declare identity/version, named capability descriptions/schemas, invok
 
 Browser jobs should use browser-native structured DOM operations through Playwright. Native Windows applications should use UI Automation and Win32 state before low-level coordinate input. `SendInput` is the last native interaction primitive when structured controls are unavailable. UFO/UFO² were reviewed as architectural references for UIA/Win32/COM composition and were not embedded. Agent-S and UI-TARS are possible future visual fallback providers, not current dependencies.
 
-The Playwright MCP child is designed with an isolated browser profile, explicit executable/server paths, sanitized environment, fixed arguments, AppContainer, Job Object, bounded stdio, cancellation, and a narrow operation allowlist. Current Node runtime resolution fails in AppContainer when it inspects `C:\`; plugin health stays false and its capabilities are unavailable. Browser-native automation is therefore not currently working.
+The Playwright MCP child has explicit Node/server/browser paths, a sanitized environment, a per-run managed profile/temp directory, AppContainer, Job Object, bounded JSONL stdio, and a narrow operation allowlist. `--preserve-symlinks-main` avoids Node's main-module `lstat('C:\\')` probe without a root ACL. The MCP handshake and fixed-tool check succeed, but Edge process creation with Playwright's `--remote-debugging-pipe` stalls during the real browser startup probe. The provider stays unhealthy and browser capabilities are unavailable; browser-native automation is therefore not currently working.
 
 ## Protocol status
 

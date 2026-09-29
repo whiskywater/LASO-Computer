@@ -62,7 +62,8 @@ int wmain(int argc, wchar_t** argv) {
             std::cout << "playwright_configured: " << (config.playwright.enabled ? "true" : "false") << '\n';
             if (config.playwright.enabled) {
                 std::wcout << L"  node_executable: " << config.playwright.node_executable << L"\n"
-                           << L"  server_entry: " << config.playwright.server_entry << L"\n";
+                           << L"  server_entry: " << config.playwright.server_entry << L"\n"
+                           << L"  browser_executable: " << config.playwright.browser_executable << L"\n";
             }
             if (std::any_of(config.capabilities.begin(), config.capabilities.end(), [](const auto& item) { return item.second == laso::Decision::allow; }))
                 std::cout << "warning: one or more capabilities are explicitly allowed\n";

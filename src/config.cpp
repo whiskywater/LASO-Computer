@@ -116,7 +116,7 @@ bool Config::validate(std::string& error) const {
         }
     }
     if (playwright.enabled) {
-        for (const auto* path : {&playwright.node_executable, &playwright.server_entry}) {
+        for (const auto* path : {&playwright.node_executable, &playwright.server_entry, &playwright.browser_executable}) {
             const std::filesystem::path candidate(*path);
             if (path->empty() || path->size() > 4096 || !candidate.is_absolute() || candidate.lexically_normal() != candidate) {
                 error = "enabled Playwright plugin paths must be clean absolute paths"; return false;
@@ -153,10 +153,14 @@ Config Config::load(const std::filesystem::path& path) {
         require_keys(plugins, {}, {"playwright"});
         if (plugins.contains("playwright")) {
             const auto& playwright = plugins.at("playwright");
-            require_keys(playwright, {"enabled", "node_executable", "server_entry"});
+            require_keys(playwright, {"enabled", "node_executable", "server_entry"}, {"browser_executable"});
             cfg.playwright.enabled = playwright.at("enabled").get<bool>();
             cfg.playwright.node_executable = widen(playwright.at("node_executable").get<std::string>());
             cfg.playwright.server_entry = widen(playwright.at("server_entry").get<std::string>());
+            if (playwright.contains("browser_executable"))
+                cfg.playwright.browser_executable = widen(playwright.at("browser_executable").get<std::string>());
+            if (cfg.playwright.enabled && cfg.playwright.browser_executable.empty())
+                throw std::runtime_error("enabled Playwright plugin requires an explicit browser executable");
         }
     }
     std::string error;
@@ -181,7 +185,8 @@ void Config::save_example(const std::filesystem::path& path) const {
     const nlohmann::json output{
         {"version", 1}, {"default_decision", "deny"}, {"capabilities", nlohmann::json::object()},
         {"shell", {{"allowed_executables", nlohmann::json::array()}, {"environment_allowlist", nlohmann::json::array()}}},
-        {"plugins", {{"playwright", {{"enabled", false}, {"node_executable", ""}, {"server_entry", ""}}}}},
+        {"plugins", {{"playwright", {{"enabled", false}, {"node_executable", ""}, {"server_entry", ""},
+                                       {"browser_executable", ""}}}}},
         {"approval_timeout_ms", 60000}};
     const auto data = output.dump(2) + "\n";
     HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,

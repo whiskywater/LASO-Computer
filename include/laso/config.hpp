@@ -21,6 +21,7 @@ struct Config {
         bool enabled{false};
         std::wstring node_executable;
         std::wstring server_entry;
+        std::wstring browser_executable;
     } playwright;
 
     [[nodiscard]] Decision decision_for(const std::string& capability) const;

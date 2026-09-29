@@ -9,10 +9,10 @@
 
 #include <algorithm>
 #include <array>
-#include <charconv>
 #include <cctype>
 #include <cstddef>
 #include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <stdexcept>
 #include <string_view>
@@ -109,7 +109,7 @@ void revoke_appcontainer_access(const std::filesystem::path& path, PSID sid) noe
     EXPLICIT_ACCESSW access{};
     access.grfAccessMode = REVOKE_ACCESS;
     access.Trustee.TrusteeForm = TRUSTEE_IS_SID;
-    access.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+    access.Trustee.TrusteeType = TRUSTEE_IS_UNKNOWN;
     access.Trustee.ptstrName = static_cast<LPWSTR>(sid);
     PACL updated_acl = nullptr;
     if (SetEntriesInAclW(1, &access, old_acl, &updated_acl) == ERROR_SUCCESS) {
@@ -179,14 +179,42 @@ struct PlaywrightMcpProvider::Impl {
     ~Impl() { stop(); }
 
     void start() {
-        const std::filesystem::path node(config.node_executable), server(config.server_entry);
-        if (!safe_path(node, false) || !safe_path(server, false)) throw std::runtime_error("configured Playwright runtime paths must be existing non-reparse paths");
+        const std::filesystem::path node(config.node_executable), server(config.server_entry), browser(config.browser_executable);
+        if (!safe_path(node, false) || !safe_path(server, false) || !safe_path(browser, false))
+            throw std::runtime_error("configured Playwright runtime paths must be existing non-reparse paths");
+        const auto package_manifest = server.parent_path() / L"package.json";
+        if (!safe_path(package_manifest, false)) throw std::runtime_error("configured Playwright package is invalid");
+        std::ifstream manifest_stream(package_manifest, std::ios::binary);
+        const std::string manifest_text((std::istreambuf_iterator<char>(manifest_stream)), std::istreambuf_iterator<char>());
+        if (!manifest_stream.good() && !manifest_stream.eof()) throw std::runtime_error("configured Playwright package is invalid");
+        if (manifest_text.size() > 65536) throw std::runtime_error("configured Playwright package is invalid");
+        const auto manifest = nlohmann::json::parse(manifest_text, nullptr, false);
+        if (!manifest.is_object() || manifest.value("name", "") != "@playwright/mcp" || manifest.value("version", "") != "0.0.83")
+            throw std::runtime_error("Playwright provider package version is not the tested 0.0.83 release");
         const auto local = environment_value(L"LOCALAPPDATA");
         if (local.empty()) throw std::runtime_error("Playwright plugin unavailable");
-        plugin_temp = std::filesystem::path(local) / L"LASO-Computer" / L"plugin-temp";
+        const auto plugin_root = std::filesystem::path(local) / L"LASO-Computer" / L"plugin-temp";
         std::error_code ec;
-        std::filesystem::create_directories(plugin_temp, ec);
-        if (ec || !safe_path(plugin_temp, true)) throw std::runtime_error("Playwright plugin unavailable");
+        std::filesystem::create_directories(plugin_root, ec);
+        if (ec || !safe_path(plugin_root, true)) throw std::runtime_error("Playwright plugin unavailable");
+        GUID temp_id{};
+        wchar_t temp_name[40]{};
+        if (FAILED(CoCreateGuid(&temp_id)) || StringFromGUID2(temp_id, temp_name, static_cast<int>(std::size(temp_name))) == 0)
+            throw std::runtime_error("Playwright plugin unavailable");
+        plugin_temp = plugin_root / temp_name;
+        if (!std::filesystem::create_directory(plugin_temp, ec) || ec || !safe_path(plugin_temp, true))
+            throw std::runtime_error("Playwright plugin unavailable");
+        const auto browser_profile = plugin_temp / L"browser-profile";
+        const auto provider_config = plugin_temp / L"provider-config.json";
+        {
+            std::ofstream config_stream(provider_config, std::ios::binary | std::ios::trunc);
+            const auto config_json = nlohmann::json{
+                {"browser", {{"isolated", false}, {"userDataDir", utf8(browser_profile.wstring())}}}
+            }.dump();
+            config_stream.write(config_json.data(), static_cast<std::streamsize>(config_json.size()));
+            config_stream.flush();
+            if (!config_stream) throw std::runtime_error("Playwright plugin configuration failed");
+        }
 
         PSID app_sid_raw = nullptr;
         const auto profile = CreateAppContainerProfile(L"LASOComputer.Playwright", L"LASO-Computer Playwright", L"Isolated LASO-Computer browser adapter", nullptr, 0, &app_sid_raw);
@@ -198,17 +226,24 @@ struct PlaywrightMcpProvider::Impl {
         if (!ConvertStringSidToSidW(L"S-1-15-3-1", &internet_sid)) throw std::runtime_error("Playwright internet capability unavailable");
 
         const auto node_directory = node.parent_path();
+        const auto browser_directory = browser.parent_path();
         auto package_directory = server.parent_path();
         for (auto parent = package_directory; !parent.empty(); parent = parent.parent_path()) {
             if (_wcsicmp(parent.filename().c_str(), L"node_modules") == 0) { package_directory = parent; break; }
             if (parent == parent.root_path()) break;
         }
-        if (!safe_path(node_directory, true) || !safe_path(package_directory, true))
+        if (!safe_path(node_directory, true) || !safe_path(package_directory, true) || !safe_path(browser_directory, true))
             throw std::runtime_error("Playwright plugin directories must be existing non-reparse directories");
-        grant_appcontainer_access(node_directory, appcontainer_sid, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | FILE_LIST_DIRECTORY | FILE_TRAVERSE);
-        acl_paths.push_back(node_directory);
-        if (package_directory != node_directory)
-            { grant_appcontainer_access(package_directory, appcontainer_sid, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | FILE_LIST_DIRECTORY | FILE_TRAVERSE); acl_paths.push_back(package_directory); }
+        const auto read_execute = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | FILE_LIST_DIRECTORY | FILE_TRAVERSE;
+        const auto grant_once = [this](const std::filesystem::path& path, DWORD mask) {
+            if (std::find(acl_paths.begin(), acl_paths.end(), path) != acl_paths.end()) return;
+            grant_appcontainer_access(path, appcontainer_sid, mask);
+            acl_paths.push_back(path);
+        };
+        grant_once(node_directory, read_execute);
+        grant_once(package_directory, read_execute);
+        // Installed Edge under Program Files already grants read/execute to
+        // ALL APPLICATION PACKAGES. Do not alter its ACL from the endpoint.
         grant_appcontainer_access(plugin_temp, appcontainer_sid, FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | FILE_LIST_DIRECTORY | FILE_TRAVERSE | DELETE);
         acl_paths.push_back(plugin_temp);
 
@@ -249,11 +284,12 @@ struct PlaywrightMcpProvider::Impl {
         startup.StartupInfo.hStdOutput = child_output.get();
         startup.StartupInfo.hStdError = child_stderr.get();
         startup.lpAttributeList = attributes;
-        // Node's default realpath pass walks the volume root while resolving
-        // modules. Keeping resolved module paths avoids that broad traversal;
-        // package and executable paths are separately checked above.
-        std::wstring command = quote(node.native()) + L" --preserve-symlinks " + quote(server.native()) +
-            L" --isolated --browser msedge --headless --no-webmcp --output-dir " + quote(plugin_temp.native()) +
+        // Node realpaths the main CommonJS entry by default, which probes the
+        // volume root. Preserve the configured main/dependency paths instead;
+        // never grant the AppContainer access to the volume root for this.
+        std::wstring command = quote(node.native()) + L" --preserve-symlinks --preserve-symlinks-main " + quote(server.native()) +
+            L" --browser msedge --headless --config " + quote(provider_config.native()) + L" --no-webmcp --output-dir " + quote(plugin_temp.native()) +
+            L" --executable-path " + quote(browser.native()) +
             L" --timeout-action 5000 --timeout-navigation 20000 --output-max-size 1048576";
         std::vector<wchar_t> mutable_command(command.begin(), command.end()); mutable_command.push_back(L'\0');
         auto environment = safe_environment(plugin_temp);
@@ -294,19 +330,34 @@ struct PlaywrightMcpProvider::Impl {
     }
 
     void send(const nlohmann::json& value) {
-        const auto payload = value.dump();
-        if (payload.size() > max_frame_bytes) throw std::runtime_error("Playwright request exceeds size limit");
-        const auto header = std::string("Content-Length: ") + std::to_string(payload.size()) + "\r\n\r\n";
-        DWORD written = 0;
-        if (!WriteFile(input.get(), header.data(), static_cast<DWORD>(header.size()), &written, nullptr) || written != header.size() ||
-            !WriteFile(input.get(), payload.data(), static_cast<DWORD>(payload.size()), &written, nullptr) || written != payload.size())
-            throw std::runtime_error("Playwright provider transport failed");
+        auto payload = value.dump();
+        if (payload.size() + 1 > max_frame_bytes) throw std::runtime_error("Playwright request exceeds size limit");
+        payload.push_back('\n');
+        std::size_t offset = 0;
+        while (offset < payload.size()) {
+            DWORD written = 0;
+            const auto remaining = payload.size() - offset;
+            const auto amount = static_cast<DWORD>(std::min<std::size_t>(remaining, 16U * 1024U));
+            if (!WriteFile(input.get(), payload.data() + offset, amount, &written, nullptr) || written == 0)
+                throw std::runtime_error("Playwright provider transport failed");
+            offset += written;
+        }
     }
 
     std::string receive(const std::function<bool()>& cancelled, ULONGLONG deadline) {
         for (;;) {
             if (cancelled && cancelled()) throw std::runtime_error("cancelled");
             if (GetTickCount64() >= deadline) throw std::runtime_error("timed out");
+            const auto newline = buffered.find('\n');
+            if (newline != std::string::npos) {
+                if (newline + 1 > max_frame_bytes) throw std::runtime_error("Playwright response exceeds size limit");
+                std::string body = buffered.substr(0, newline);
+                buffered.erase(0, newline + 1);
+                if (!body.empty() && body.back() == '\r') body.pop_back();
+                if (body.empty()) throw std::runtime_error("invalid Playwright protocol frame");
+                return body;
+            }
+            if (buffered.size() >= max_frame_bytes) throw std::runtime_error("Playwright response exceeds size limit");
             DWORD available = 0;
             if (!PeekNamedPipe(output.get(), nullptr, 0, nullptr, &available, nullptr)) {
                 DWORD exit_code = STILL_ACTIVE;
@@ -320,33 +371,6 @@ struct PlaywrightMcpProvider::Impl {
                 if (!ReadFile(output.get(), bytes.data(), std::min<DWORD>(available, static_cast<DWORD>(bytes.size())), &read, nullptr) || !read)
                     throw std::runtime_error("Playwright provider transport failed");
                 buffered.append(bytes.data(), read);
-                if (buffered.size() > max_frame_bytes + 4096) throw std::runtime_error("Playwright response exceeds size limit");
-                const auto header_end = buffered.find("\r\n\r\n");
-                if (header_end != std::string::npos) {
-                    std::size_t size = 0;
-                    bool found = false;
-                    std::size_t line = 0;
-                    while (line < header_end) {
-                        const auto end = buffered.find("\r\n", line);
-                        const auto actual_end = end == std::string::npos || end > header_end ? header_end : end;
-                        const auto content = std::string_view(buffered).substr(line, actual_end - line);
-                        constexpr std::string_view key = "content-length:";
-                        if (content.size() >= key.size() && lower(std::string(content.substr(0, key.size()))) == key) {
-                            const auto first = content.find_first_not_of(" \t", key.size());
-                            if (first == std::string_view::npos) throw std::runtime_error("invalid Playwright protocol frame");
-                            const auto [ptr, error] = std::from_chars(content.data() + first, content.data() + content.size(), size);
-                            if (error != std::errc{} || ptr != content.data() + content.size()) throw std::runtime_error("invalid Playwright protocol frame");
-                            found = true;
-                        }
-                        line = actual_end + 2;
-                    }
-                    if (!found || size == 0 || size > max_frame_bytes) throw std::runtime_error("invalid Playwright protocol frame");
-                    if (buffered.size() >= header_end + 4 + size) {
-                        std::string body = buffered.substr(header_end + 4, size);
-                        buffered.erase(0, header_end + 4 + size);
-                        return body;
-                    }
-                }
             } else {
                 if (WaitForSingleObject(process.get(), 0) == WAIT_OBJECT_0) throw std::runtime_error("Playwright provider stopped");
                 Sleep(5);
@@ -356,8 +380,33 @@ struct PlaywrightMcpProvider::Impl {
 
     nlohmann::json receive_response(unsigned long long expected, const std::function<bool()>& cancelled, ULONGLONG deadline) {
         for (;;) {
-            const auto response = nlohmann::json::parse(receive(cancelled, deadline));
-            if (response.is_object() && response.value("id", nlohmann::json{}) == expected) return response;
+            nlohmann::json response;
+            try { response = nlohmann::json::parse(receive(cancelled, deadline)); }
+            catch (const nlohmann::json::exception&) { throw std::runtime_error("invalid Playwright protocol message"); }
+            if (!response.is_object() || !response.contains("jsonrpc") || !response.at("jsonrpc").is_string() ||
+                response.at("jsonrpc").get_ref<const std::string&>() != "2.0")
+                throw std::runtime_error("invalid Playwright protocol message");
+            if (!response.contains("id")) {
+                if (!response.contains("method") || !response.at("method").is_string())
+                    throw std::runtime_error("invalid Playwright protocol notification");
+                continue;
+            }
+            if (!response.at("id").is_number_integer() && !response.at("id").is_string())
+                throw std::runtime_error("invalid Playwright protocol request id");
+            if (response.at("id") == expected && !response.contains("method") &&
+                (response.contains("result") || response.contains("error"))) return response;
+            if (!response.contains("method")) {
+                if (response.contains("result") || response.contains("error")) continue;
+                throw std::runtime_error("invalid Playwright protocol response");
+            }
+            if (!response.at("method").is_string()) throw std::runtime_error("invalid Playwright protocol request");
+            const auto method = response.value("method", "");
+            if (method == "ping") {
+                send({{"jsonrpc", "2.0"}, {"id", response.at("id")}, {"result", nlohmann::json::object()}});
+            } else {
+                send({{"jsonrpc", "2.0"}, {"id", response.at("id")},
+                      {"error", {{"code", -32601}, {"message", "Method not found"}}}});
+            }
         }
     }
 
@@ -368,7 +417,42 @@ struct PlaywrightMcpProvider::Impl {
                            {"clientInfo", {{"name", "laso-computer"}, {"version", "1.0.0"}}}}}});
         const auto response = receive_response(id, {}, GetTickCount64() + 30000);
         if (response.contains("error") || !response.contains("result")) throw std::runtime_error("Playwright provider initialization failed");
+        const auto& result = response.at("result");
+        if (!result.is_object() || result.value("protocolVersion", "") != "2025-03-26" ||
+            !result.contains("serverInfo") || !result.at("serverInfo").is_object() ||
+            result.at("serverInfo").value("name", "") != "Playwright" ||
+            result.at("serverInfo").value("version", "") != "1.64.0-alpha-1790635538000")
+            throw std::runtime_error("Playwright MCP handshake did not match the pinned provider build");
         send({{"jsonrpc", "2.0"}, {"method", "notifications/initialized"}});
+
+        const auto tools_id = next_id++;
+        send({{"jsonrpc", "2.0"}, {"id", tools_id}, {"method", "tools/list"}, {"params", nlohmann::json::object()}});
+        const auto tools_response = receive_response(tools_id, {}, GetTickCount64() + 30000);
+        if (tools_response.contains("error") || !tools_response.contains("result") ||
+            !tools_response.at("result").is_object() || !tools_response.at("result").contains("tools") ||
+            !tools_response.at("result").at("tools").is_array())
+            throw std::runtime_error("Playwright MCP tools handshake failed");
+        constexpr std::array<std::string_view, 9> required_tools{
+            "browser_navigate", "browser_snapshot", "browser_find", "browser_click", "browser_type",
+            "browser_select_option", "browser_tabs", "browser_navigate_back", "browser_take_screenshot"};
+        const auto& available = tools_response.at("result").at("tools");
+        for (const auto tool : required_tools) {
+            if (std::none_of(available.begin(), available.end(), [tool](const auto& item) {
+                    return item.is_object() && item.value("name", "") == tool;
+                }))
+                throw std::runtime_error("Playwright MCP required tool is unavailable");
+        }
+
+        // MCP initialization alone does not launch the browser. Probe an
+        // actual browser operation before advertising capabilities so a
+        // provider with a broken browser subprocess fails closed at startup.
+        const auto browser_id = next_id++;
+        send({{"jsonrpc", "2.0"}, {"id", browser_id}, {"method", "tools/call"},
+              {"params", {{"name", "browser_tabs"}, {"arguments", {{"action", "list"}}}}}});
+        const auto browser_response = receive_response(browser_id, {}, GetTickCount64() + 10000);
+        if (browser_response.contains("error") || !browser_response.contains("result") ||
+            browser_response.at("result").value("isError", false))
+            throw std::runtime_error("Playwright browser failed its startup probe");
     }
 
     nlohmann::json call(std::string tool, nlohmann::json args, const InvocationContext& invocation) {
@@ -378,9 +462,18 @@ struct PlaywrightMcpProvider::Impl {
             throw std::runtime_error("capability unavailable");
         }
         const auto id = next_id++;
-        send({{"jsonrpc", "2.0"}, {"id", id}, {"method", "tools/call"},
-              {"params", {{"name", std::move(tool)}, {"arguments", std::move(args)}}}});
-        const auto response = receive_response(id, invocation.cancelled, GetTickCount64() + std::clamp(invocation.timeout_ms, 100U, 300000U));
+        nlohmann::json response;
+        try {
+            send({{"jsonrpc", "2.0"}, {"id", id}, {"method", "tools/call"},
+                  {"params", {{"name", std::move(tool)}, {"arguments", std::move(args)}}}});
+            response = receive_response(id, invocation.cancelled,
+                GetTickCount64() + std::clamp(invocation.timeout_ms, 100U, 300000U));
+        } catch (...) {
+            // A timeout/cancellation or broken transport desynchronizes the
+            // single-flight MCP channel. Tear down the whole job immediately.
+            stop();
+            throw;
+        }
         if (response.contains("error") || !response.contains("result")) throw std::runtime_error("Playwright provider request failed");
         const auto& result = response.at("result");
         if (result.value("isError", false)) throw std::runtime_error("Playwright browser action failed");
@@ -400,6 +493,11 @@ struct PlaywrightMcpProvider::Impl {
             for (const auto& path : acl_paths) revoke_appcontainer_access(path, appcontainer_sid);
         }
         acl_paths.clear();
+        if (!plugin_temp.empty() && safe_path(plugin_temp, true)) {
+            std::error_code cleanup_error;
+            std::filesystem::remove_all(plugin_temp, cleanup_error);
+        }
+        plugin_temp.clear();
         if (attributes) { DeleteProcThreadAttributeList(attributes); attributes = nullptr; }
         attributes_storage.clear();
         if (internet_sid) { LocalFree(internet_sid); internet_sid = nullptr; }
@@ -491,7 +589,7 @@ nlohmann::json PlaywrightMcpProvider::invoke(const InvocationContext& invocation
         tool = "browser_tabs"; mapped["action"] = action;
         if (args.contains("index")) mapped["index"] = args.at("index");
     } else if (invocation.capability == "browser.back") tool = "browser_navigate_back";
-    else if (invocation.capability == "browser.screenshot") tool = "browser_take_screenshot";
+    else if (invocation.capability == "browser.screenshot") { tool = "browser_take_screenshot"; mapped["scale"] = "css"; }
     else throw std::runtime_error("capability unavailable");
     return impl_->call(std::move(tool), std::move(mapped), invocation);
 }

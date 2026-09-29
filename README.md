@@ -8,7 +8,7 @@ The public implementation is native C++20 for Windows 10/11 x64. It has no Go, P
 
 The native provider implements bounded screen capture, pointer movement and clicks, literal keyboard text and key input, Unicode clipboard read/write, visible-window enumeration/focus, bounded Windows UI Automation inspection and control invocation, and restricted direct process execution. The endpoint also has a provider registry with capability schemas, health reporting, timeouts, cancellation tokens, bounded results, and audit attribution.
 
-A Playwright MCP adapter is present and isolated as a Windows AppContainer child process, with fixed MCP operations and no arbitrary code execution capability. However, the current Node runtime attempts to inspect the `C:\` volume root during module resolution, which the configured low-privilege AppContainer cannot access. The adapter fails closed and remains unavailable. Browser capabilities must not be treated as supported until that isolation issue is resolved and the full browser lane passes. No actual browser operation was validated.
+A Playwright MCP adapter is present as a Windows AppContainer child process, with a fixed MCP operation map and no arbitrary code execution capability. The Node volume-root probe was resolved with `--preserve-symlinks-main`; no access to `C:\` was granted. The MCP initialize/tools handshake now succeeds. However, the first real browser operation stalls while Node creates Edge with Playwright's `--remote-debugging-pipe`, and LASO-Computer's startup probe times out. The adapter therefore fails closed and browser capabilities remain unavailable. No browser operation has passed through LASO-Computer.
 
 ## Build
 
@@ -47,7 +47,7 @@ Without a status/configuration option, the executable reads and writes bounded J
 
 - Endpoint policy defaults to deny; LASO-side authorization never overrides local policy.
 - Providers expose named capabilities and cannot dispatch an implicit unrestricted plugin execution operation.
-- External providers are untrusted until configured and policy-enabled. The Playwright adapter uses a fixed operation map, an isolated managed browser profile, a sanitized environment, bounded stdio, a Windows AppContainer and a kill-on-close Job Object. Its current sandbox startup failure leaves it disabled.
+- External providers are untrusted until configured and policy-enabled. The Playwright adapter uses a fixed operation map, a per-run managed browser profile and temp directory, a sanitized environment, bounded stdio, a Windows AppContainer and a kill-on-close Job Object. Its browser launch currently fails the startup probe, so browser capabilities remain unavailable.
 - `shell.execute` uses direct process creation, not `cmd.exe` or PowerShell. It requires an exact clean absolute executable path allowlist, bounded arguments/results, a temporary working directory, an explicit environment allowlist, and timeout/cancellation.
 - Audit events omit capability arguments, clipboard contents, typed text, URLs, process output, and screenshots. Sensitive values are returned only to the authorized caller when the corresponding capability is allowed.
 - Input and output frames are centrally bounded. Truncated process output is explicitly identified; clipboard and bounded structured reads fail rather than silently returning partial data.
@@ -64,7 +64,7 @@ Third-party plugins do not receive unrestricted machine access. A provider must 
 
 - No remote enrollment, endpoint network transport, lease/reconnect protocol, or remote machine targeting. LASO must supervise the process locally.
 - No proven end-to-end integration against the current public LASO revision because it does not publish the worker-process contract expected by this worker. Approval request/response framing remains unavailable and therefore deny-by-default.
-- Playwright adapter exists but does not currently start successfully under its AppContainer sandbox; no browser capability is advertised as validated.
+- Playwright MCP initialize/tools handshake works under AppContainer, but actual Edge process creation with Playwright's remote debugging pipe stalls. The startup probe fails closed; no browser action is validated. See [Playwright provider investigation](docs/playwright-provider.md).
 - UI Automation coverage depends on each application's accessible control tree and provider support. Foreground focus remains subject to Windows policy.
 - Interactive desktop tests require a logged-in user session; GitHub-hosted CI runs only noninteractive core tests.
 - No Agent-S/UI-TARS visual reasoning, filesystem transfer, installer/service package, local emergency-stop UI, or remote enrollment.
