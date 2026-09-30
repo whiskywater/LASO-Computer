@@ -54,4 +54,9 @@ if(BUILD_TESTING)
   add_executable(laso-desktop-tests tests/desktop_tests.cpp)
   target_link_libraries(laso-desktop-tests PRIVATE laso_core Ole32 User32)
   target_compile_options(laso-desktop-tests PRIVATE /W4 /permissive- /EHsc /utf-8)
+  # Manual Windows experiment; it launches Node under a token with all
+  # optional privileges disabled and reports actual file/process access.
+  add_executable(laso-restricted-token-probe tests/restricted_token_probe.cpp)
+  target_link_libraries(laso-restricted-token-probe PRIVATE Advapi32)
+  target_compile_options(laso-restricted-token-probe PRIVATE /W4 /permissive- /EHsc /utf-8)
 endif()

@@ -15,4 +15,6 @@ Audited 2026-09-28 for architecture and license planning. Projects in this table
 
 The optional `plugins/playwright/package-lock.json` pins the selected npm package and transitive graph. Running `npm ci` requires a user-installed Node/npm toolchain; Node is not needed for the core executable. Browser operations previously passed locally with Node 24.21.0; the original `realpath` failure reproduced on Node 22.23.3 as well. The exact-version named-pipe patch is wired to npm `postinstall`, but clean `npm ci` execution remains unverified. The temporary loopback exemption was removed; the latest attachment recheck is blocked. See [playwright-provider.md](playwright-provider.md) for results and residual risk.
 
+The later restricted-token experiment also used the pinned MCP 0.0.83 package. A privilege-stripped Medium-IL token passed the local browser fixture but retained arbitrary outside-file read/write access; a restricting SID did not start Node with runtime-only ACLs. No alternate production integration or new third-party dependency was added. See [restricted-token-experiment.md](restricted-token-experiment.md).
+
 Windows SDK APIs (Win32, UI Automation, WIC, COM) are linked from the installed Windows SDK and are not third-party bundled runtimes. Verify upstream versions and license files again before enabling any optional integration in a release.
