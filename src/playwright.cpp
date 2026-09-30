@@ -678,6 +678,8 @@ struct PlaywrightMcpProvider::Impl {
             const auto normalized = lower(diagnostic);
             if (normalized.find("econnrefused") != std::string::npos)
                 throw std::runtime_error("Playwright MCP could not connect to managed Edge over loopback (ECONNREFUSED)");
+            if (normalized.find("etimedout") != std::string::npos)
+                throw std::runtime_error("Playwright MCP timed out connecting to managed Edge over loopback (ETIMEDOUT)");
             if (normalized.find("eperm") != std::string::npos || normalized.find("eacces") != std::string::npos)
                 throw std::runtime_error("Playwright MCP was denied access during browser attachment (permission error)");
             throw std::runtime_error("Playwright MCP could not attach to the managed browser");

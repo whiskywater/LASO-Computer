@@ -25,7 +25,7 @@ There is no operation to add loopback exemptions, launch processes, execute shel
 
 Windows' `NetworkIsolationSetAppContainerConfig` replaces the whole configured SID list and offers no compare-and-swap. The broker reads the list, preserves every unrelated SID, and removes only the fixed LASO SID; a concurrent administrator change in the narrow read/write window cannot be atomically excluded. Avoid running this cleanup while another administrator is editing loopback exemptions. Do not add new list-writing operations without resolving this platform limitation.
 
-Bootstrap never adds a loopback exemption. `dev-preflight.ps1` queries and, if necessary, removes this single legacy entry through the broker without prompting for UAC. This cleanup is idempotent and does not alter unrelated AppContainer entries. Current no-exemption browser attachment has not passed; the failure and unresolved cause are recorded in the Playwright provider document.
+Bootstrap never adds a loopback exemption. `dev-preflight.ps1` queries and, if necessary, removes this single legacy entry through the broker without prompting for UAC. This cleanup is idempotent and does not alter unrelated AppContainer entries. A 2026-09-30 clean Debug reproduction found that no-exemption browser attachment fails because AppContainer MCP gets `ETIMEDOUT` connecting to C++-owned Edge over loopback. The same dynamic CDP endpoint and complete browser fixture pass when the provider is run outside AppContainer for diagnosis. See the Playwright provider document. Browser acceptance therefore requires an attended decision about a narrowly scoped loopback allowance or a future non-TCP transport; this workflow does not request UAC or silently recreate an exemption.
 
 ## Preflight and unattended work
 
@@ -35,9 +35,9 @@ Run this before starting long tasks:
 .\tools\dev-preflight.ps1
 ```
 
-The preflight never elevates. With an installed broker, it checks protocol compatibility and cleans only the known stale loopback state through the typed RPC. Without a broker, it reports that privileged setup is unavailable while allowing normal build, unit, and protocol tests to proceed. It does not perform a browser acceptance run; verify the Playwright lane separately before scheduling long browser work. On 2026-09-30, the current host's browser attach probe failed after the legacy exemption had been removed, so that lane is presently blocked pending root-cause investigation. Use `-RequireBroker` only for a task whose planned lane truly depends on the broker.
+The preflight never elevates. With an installed broker, it checks protocol compatibility and cleans only the known stale loopback state through the typed RPC. Without a broker, it reports that privileged setup is unavailable while allowing normal build, unit, and protocol tests to proceed. It does not perform a browser acceptance run; verify the Playwright lane separately before scheduling long browser work. On 2026-09-30, the current host's browser attach probe timed out because the AppContainer could not reach Edge's CDP listener over loopback after the exemption had been removed. Use `-RequireBroker` only for a task whose planned lane truly depends on the broker.
 
-If preflight reports a broker version mismatch, do not install it during unattended work. Build the new broker and continue tests that do not depend on the new operation; report “broker update pending” for the next attended bootstrap. Adding privileged functionality requires a deliberate broker protocol/source change, review, tests, and attended update.
+If preflight reports a broker version mismatch, do not install it during unattended work. Build the new broker and continue tests that do not depend on the new operation; report “broker update pending” for the next attended bootstrap. Adding privileged functionality requires a deliberate broker protocol/source change, review, tests, and attended update. Current AppContainer-to-Edge CDP loopback is not available with an empty loopback-exemption list; preflight reports whether legacy state is present but does not add it.
 
 ## Test classes
 
