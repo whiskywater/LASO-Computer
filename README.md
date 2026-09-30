@@ -22,7 +22,7 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-Before a long unattended development task, run `tools\dev-preflight.ps1`. It never elevates. It checks the optional broker and can clean only the fixed legacy loopback state when brokered; it does not replace the separate Playwright acceptance test. Broker install/update/removal are attended administrator actions; see [unattended Windows development](docs/unattended-windows-development.md).
+Before a long unattended development task, run `tools\dev-preflight.ps1`. It never elevates. It checks the optional broker and reports whether the Playwright loopback prerequisite is present; it does not remove that state unless explicitly invoked with `-CleanupLegacyLoopback`. It does not replace the separate Playwright acceptance test. Broker install/update/removal are attended administrator actions; see [unattended Windows development](docs/unattended-windows-development.md).
 
 `laso-desktop-tests.exe` is an interactive-session fixture and is intentionally not part of CTest. Run it only in an interactive Windows session; it creates its own disposable window and restores cursor, foreground window, and clipboard when possible:
 

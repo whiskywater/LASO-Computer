@@ -2,7 +2,8 @@
 [CmdletBinding()]
 param(
     [string]$BuildDirectory = '',
-    [switch]$RequireBroker
+    [switch]$RequireBroker,
+    [switch]$CleanupLegacyLoopback
 )
 $ErrorActionPreference = 'Stop'
 Write-Host 'LASO-Computer unattended preflight'
@@ -14,10 +15,9 @@ $ctl = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
 if (!$ctl) {
     Write-Host 'Broker: not installed'
     Write-Host 'Protocol: unavailable'
-    Write-Host 'Required provisioning: none for normal build, unit-test, or current Playwright lanes'
-    Write-Host 'Playwright privileged setup: not required'
-    Write-Host 'Stale loopback exemption: cannot query without broker'
-    Write-Host 'Browser acceptance: not run by this preflight; run the Playwright acceptance lane separately'
+    Write-Host 'Required provisioning: none for normal build and unit-test lanes'
+    Write-Host 'Playwright loopback state: UNKNOWN (broker not installed)'
+    Write-Host 'Browser acceptance: not verified; current AppContainer provider needs loopback access to managed Edge'
     Write-Host 'Interactive UAC expected: NO'
     if ($RequireBroker) {
         Write-Host 'Unattended test readiness: BLOCKED (attended broker bootstrap required for privileged lanes)'
@@ -32,8 +32,8 @@ if (!$service -or $service.Status -ne 'Running') {
     if (!$service) { Write-Host 'Broker: binaries available; service not installed' }
     else { Write-Host "Broker: service $($service.Status)" }
     Write-Host 'Required provisioning: none for non-privileged lanes'
-    Write-Host 'Playwright privileged setup: not required'
-    Write-Host 'Browser acceptance: not run by this preflight; run the Playwright acceptance lane separately'
+    Write-Host 'Playwright loopback state: UNKNOWN (broker service unavailable)'
+    Write-Host 'Browser acceptance: not verified; current AppContainer provider needs loopback access to managed Edge'
     Write-Host 'Interactive UAC expected: NO'
     if ($RequireBroker) { Write-Host 'Unattended test readiness: BLOCKED (attended bootstrap or service start required)'; exit 2 }
     Write-Host 'Non-privileged build/unit lanes: READY'
@@ -66,17 +66,26 @@ $loopbackText = & $ctl legacy-loopback
 if ($LASTEXITCODE -ne 0) { throw 'Broker status worked but legacy-state query failed.' }
 $loopback = $loopbackText | ConvertFrom-Json
 if ($loopback.result.enabled) {
-    Write-Host 'Stale legacy loopback exemption: present; requesting broker-scoped cleanup.'
-    & $ctl cleanup-legacy-loopback | Out-Host
-    if ($LASTEXITCODE -ne 0) { throw 'Broker cleanup failed; no UAC was requested.' }
-    $verifiedText = & $ctl legacy-loopback
-    if ($LASTEXITCODE -ne 0 -or ($verifiedText | ConvertFrom-Json).result.enabled) {
-        throw 'Broker cleanup could not verify removal; no UAC was requested.'
+    Write-Host 'Playwright loopback exemption: present; required by current AppContainer-to-Edge CDP transport.'
+    if ($CleanupLegacyLoopback) {
+        Write-Host 'Explicit cleanup requested; this will block the current AppContainer browser lane.'
+        & $ctl cleanup-legacy-loopback | Out-Host
+        if ($LASTEXITCODE -ne 0) { throw 'Broker cleanup failed; no UAC was requested.' }
+        $verifiedText = & $ctl legacy-loopback
+        if ($LASTEXITCODE -ne 0 -or ($verifiedText | ConvertFrom-Json).result.enabled) {
+            throw 'Broker cleanup could not verify removal; no UAC was requested.'
+        }
+        Write-Host 'Playwright loopback exemption: removed by explicit request; AppContainer browser lane is BLOCKED.'
     }
+} else {
+    Write-Host 'Playwright loopback exemption: absent; AppContainer browser lane is BLOCKED.'
+    if ($CleanupLegacyLoopback) { Write-Host 'Explicit cleanup requested; no managed exemption was present.' }
 }
-Write-Host 'Required provisioning: OK'
-Write-Host 'Playwright privileged setup: not required'
-Write-Host 'Stale loopback exemption: none'
-Write-Host 'Browser acceptance: not run by this preflight'
+Write-Host 'Broker protocol: OK'
+if (-not $loopback.result.enabled -or $CleanupLegacyLoopback) {
+    Write-Host 'Browser acceptance: BLOCKED until loopback is provisioned by an attended administrator decision'
+} else {
+    Write-Host 'Browser acceptance: loopback prerequisite present; run the Playwright acceptance lane to validate'
+}
 Write-Host 'Interactive UAC expected: NO'
 Write-Host 'Broker preflight: PASS'
