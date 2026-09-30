@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 #include <thread>
@@ -172,26 +173,24 @@ std::vector<wchar_t> browser_environment(const std::filesystem::path& run_path) 
     return block;
 }
 
-unsigned short allocate_loopback_port() {
-    WSADATA data{};
-    if (WSAStartup(MAKEWORD(2, 2), &data) != 0) throw std::runtime_error("browser endpoint setup failed");
-    SOCKET socket = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, nullptr, 0, WSA_FLAG_NO_HANDLE_INHERIT);
-    if (socket == INVALID_SOCKET) { WSACleanup(); throw std::runtime_error("browser endpoint setup failed"); }
-    sockaddr_in address{};
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    address.sin_port = 0;
-    const bool bound = bind(socket, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0;
-    int length = sizeof(address);
-    if (!bound || getsockname(socket, reinterpret_cast<sockaddr*>(&address), &length) != 0) {
-        closesocket(socket); WSACleanup(); throw std::runtime_error("browser endpoint setup failed");
-    }
-    const auto port = ntohs(address.sin_port);
-    closesocket(socket);
-    WSACleanup();
-    return port;
-}
 
+std::optional<std::pair<unsigned short, std::string>> read_devtools_active_port(const std::filesystem::path& profile) {
+    std::ifstream stream(profile / L"DevToolsActivePort", std::ios::binary);
+    if (!stream) return std::nullopt;
+    std::string port_text, browser_path;
+    if (!std::getline(stream, port_text) || !std::getline(stream, browser_path)) return std::nullopt;
+    if (!port_text.empty() && port_text.back() == '\r') port_text.pop_back();
+    if (!browser_path.empty() && browser_path.back() == '\r') browser_path.pop_back();
+    if (!browser_path.starts_with("/devtools/browser/")) return std::nullopt;
+    try {
+        std::size_t parsed = 0;
+        const auto value = std::stoul(port_text, &parsed, 10);
+        if (parsed != port_text.size() || value == 0 || value > 65535) return std::nullopt;
+        return std::pair<unsigned short, std::string>{static_cast<unsigned short>(value), std::move(browser_path)};
+    } catch (...) {
+        return std::nullopt;
+    }
+}
 std::string http_get_localhost(unsigned short port, const wchar_t* path) {
     HINTERNET session = WinHttpOpen(L"LASO-Computer/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY,
                                     WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
@@ -244,14 +243,14 @@ bool loopback_listener_owned_by(unsigned short port, DWORD pid) {
 class BrowserProcess {
 public:
     BrowserProcess(const std::filesystem::path& executable, const std::filesystem::path& run_path)
-        : run_path_(run_path), profile_(run_path / L"profile"), port_(allocate_loopback_port()) {
+        : run_path_(run_path), profile_(run_path / L"profile") {
         std::error_code error;
         if (!std::filesystem::create_directory(profile_, error) || error || !safe_path(profile_, true))
             throw std::runtime_error("isolated browser profile could not be created");
         const auto log_file = run_path_ / L"edge.log";
         const auto command = quote(executable.native()) + L" --headless=new --no-first-run --no-default-browser-check --disable-extensions --disable-sync --disable-features=msEdgeSidebarV2 " +
             L"--enable-logging --log-file=" + quote(log_file.native()) + L" --user-data-dir=" + quote(profile_.native()) +
-            L" --remote-debugging-address=127.0.0.1 --remote-debugging-port=" + std::to_wstring(port_) + L" about:blank";
+            L" --remote-debugging-address=127.0.0.1 --remote-debugging-port=0 about:blank";
         std::vector<wchar_t> mutable_command(command.begin(), command.end()); mutable_command.push_back(L'\0');
         auto environment = browser_environment(run_path_);
         STARTUPINFOW startup{};
@@ -266,7 +265,8 @@ public:
         job_.reset(CreateJobObjectW(nullptr, nullptr));
         if (!job_) { TerminateProcess(process_.get(), 1); throw std::runtime_error("browser process isolation failed"); }
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_ACTIVE_PROCESS |
+            JOB_OBJECT_LIMIT_PROCESS_MEMORY;
         limits.BasicLimitInformation.ActiveProcessLimit = 32;
         limits.ProcessMemoryLimit = 2ULL * 1024ULL * 1024ULL * 1024ULL;
         if (!SetInformationJobObject(job_.get(), JobObjectExtendedLimitInformation, &limits, sizeof(limits)) ||
@@ -293,17 +293,26 @@ private:
         const auto deadline = GetTickCount64() + 30000;
         while (GetTickCount64() < deadline) {
             if (!healthy()) throw std::runtime_error("managed Edge exited during startup");
-            const auto body = http_get_localhost(port_, L"/json/version");
-            const auto version = nlohmann::json::parse(body, nullptr, false);
-            const auto websocket = version.is_object() ? version.value("webSocketDebuggerUrl", std::string{}) : std::string{};
-            if (version.is_object() &&
-                version.value("Browser", std::string{}).starts_with("Edg/") &&
-                websocket.starts_with("ws://127.0.0.1:" + std::to_string(port_) + "/devtools/browser/") &&
-                loopback_listener_owned_by(port_, GetProcessId(process_.get()))) return;
+            if (port_ == 0) {
+                if (const auto active = read_devtools_active_port(profile_)) {
+                    port_ = active->first;
+                    devtools_path_ = active->second;
+                }
+            }
+            if (port_ != 0) {
+                const auto body = http_get_localhost(port_, L"/json/version");
+                const auto version = nlohmann::json::parse(body, nullptr, false);
+                const auto websocket = version.is_object() ? version.value("webSocketDebuggerUrl", std::string{}) : std::string{};
+                const auto expected_websocket = "ws://127.0.0.1:" + std::to_string(port_) + devtools_path_;
+                if (version.is_object() &&
+                    version.value("Browser", std::string{}).starts_with("Edg/") &&
+                    !devtools_path_.empty() && websocket == expected_websocket &&
+                    loopback_listener_owned_by(port_, GetProcessId(process_.get()))) return;
+            }
             Sleep(100);
         }
         std::string detail = "managed Edge CDP endpoint did not become ready (port=" + std::to_string(port_) +
-            ", owned-listener=" + (loopback_listener_owned_by(port_, GetProcessId(process_.get())) ? "yes" : "no") + ")";
+            ", owned-listener=" + (port_ != 0 && loopback_listener_owned_by(port_, GetProcessId(process_.get())) ? "yes" : "no") + ")";
         std::ifstream log(log_file_, std::ios::binary);
         if (log) {
             std::string contents((std::istreambuf_iterator<char>(log)), std::istreambuf_iterator<char>());
@@ -314,6 +323,7 @@ private:
     }
     std::filesystem::path run_path_, profile_, log_file_{run_path_ / L"edge.log"};
     unsigned short port_{};
+    std::string devtools_path_;
     Handle process_, job_;
 };
 
@@ -506,7 +516,8 @@ struct PlaywrightMcpProvider::Impl {
         job.reset(CreateJobObjectW(nullptr, nullptr));
         if (!job) { TerminateProcess(process.get(), 1); throw std::runtime_error("Playwright plugin isolation failed"); }
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_ACTIVE_PROCESS |
+            JOB_OBJECT_LIMIT_PROCESS_MEMORY;
         // The attached MCP provider must not create its own browser or any
         // other child process. The C++ runtime owns Edge in a separate job.
         limits.BasicLimitInformation.ActiveProcessLimit = 1;
@@ -654,8 +665,23 @@ struct PlaywrightMcpProvider::Impl {
               {"params", {{"name", "browser_tabs"}, {"arguments", {{"action", "list"}}}}}});
         const auto browser_response = receive_response(browser_id, {}, GetTickCount64() + 10000);
         if (browser_response.contains("error") || !browser_response.contains("result") ||
-            browser_response.at("result").value("isError", false))
+            browser_response.at("result").value("isError", false)) {
+            std::string diagnostic;
+            if (browser_response.contains("error") && browser_response.at("error").is_object())
+                diagnostic = browser_response.at("error").value("message", std::string{});
+            if (browser_response.contains("result") && browser_response.at("result").is_object() &&
+                browser_response.at("result").contains("content") && browser_response.at("result").at("content").is_array()) {
+                for (const auto& item : browser_response.at("result").at("content"))
+                    if (item.is_object() && item.value("type", "") == "text" && item.contains("text") && item.at("text").is_string())
+                        diagnostic += " " + item.at("text").get<std::string>();
+            }
+            const auto normalized = lower(diagnostic);
+            if (normalized.find("econnrefused") != std::string::npos)
+                throw std::runtime_error("Playwright MCP could not connect to managed Edge over loopback (ECONNREFUSED)");
+            if (normalized.find("eperm") != std::string::npos || normalized.find("eacces") != std::string::npos)
+                throw std::runtime_error("Playwright MCP was denied access during browser attachment (permission error)");
             throw std::runtime_error("Playwright MCP could not attach to the managed browser");
+        }
     }
 
     nlohmann::json call(std::string tool, nlohmann::json args, const InvocationContext& invocation) {

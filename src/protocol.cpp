@@ -9,7 +9,9 @@ namespace laso {
 namespace {
 constexpr int protocol_version = 1;
 constexpr std::size_t max_requests = 4096;
-constexpr std::size_t max_jobs = 64;
+constexpr std::size_t max_job_ids = 4096;
+constexpr std::size_t max_active_jobs = 64;
+constexpr std::size_t max_retained_jobs = 256;
 const std::regex valid_id("^[A-Za-z0-9._:/-]{1,128}$");
 
 bool bounded_string(const nlohmann::json& value, std::size_t limit) {
@@ -78,8 +80,12 @@ nlohmann::json WorkerProtocol::handle(const nlohmann::json& request) {
     {
         std::scoped_lock lock(mutex_);
         if (seen_request_ids_.contains(request_id)) return fail(request_id, "request id already used");
-        if (seen_request_ids_.size() >= max_requests) return fail(request_id, "request replay cache full");
+        if (seen_request_ids_.size() >= max_requests) {
+            seen_request_ids_.erase(seen_request_order_.front());
+            seen_request_order_.pop_front();
+        }
         seen_request_ids_.insert(request_id);
+        seen_request_order_.push_back(request_id);
     }
     const auto operation = request["operation"].get<std::string>();
     if (shutting_down_ && operation != "shutdown") return fail(request_id, "worker is shutting down");
@@ -143,11 +149,48 @@ nlohmann::json WorkerProtocol::submit(const nlohmann::json& request) {
 
     std::scoped_lock lock(mutex_);
     if (shutting_down_) return fail(request_id, "worker is shutting down");
-    if (jobs_by_laso_id_.contains(job_id)) return fail(request_id, "job id already submitted");
-    if (jobs_.size() >= max_jobs) return fail(request_id, "active or retained job limit reached");
+    if (jobs_by_laso_id_.contains(job_id) || seen_job_ids_.contains(job_id))
+        return fail(request_id, "job id already submitted");
+
+    std::size_t active_jobs = 0;
+    for (const auto& [id, existing] : jobs_) {
+        (void)id;
+        std::scoped_lock job_lock(existing->mutex);
+        if (!existing->done) ++active_jobs;
+    }
+    if (active_jobs >= max_active_jobs) return fail(request_id, "active job limit reached");
+
+    // Retain a bounded set of completed jobs for result retries, but do not
+    // let historical completions consume the active-job budget forever.
+    while (jobs_.size() >= max_retained_jobs) {
+        auto oldest = jobs_.end();
+        for (auto it = jobs_.begin(); it != jobs_.end(); ++it) {
+            std::scoped_lock job_lock(it->second->mutex);
+            if (!it->second->done) continue;
+            if (oldest == jobs_.end() || it->second->sequence < oldest->second->sequence) oldest = it;
+        }
+        if (oldest == jobs_.end()) break;
+        auto retired = oldest->second;
+        jobs_.erase(oldest);
+        const auto active_id = jobs_by_laso_id_.find(retired->laso_id);
+        if (active_id != jobs_by_laso_id_.end() && active_id->second == retired->id)
+            jobs_by_laso_id_.erase(active_id);
+        if (retired->worker.joinable()) retired->worker.join();
+    }
+    if (jobs_.size() >= max_retained_jobs) return fail(request_id, "retained job limit reached");
+
+    if (seen_job_ids_.size() >= max_job_ids) {
+        seen_job_ids_.erase(seen_job_order_.front());
+        seen_job_order_.pop_front();
+    }
+    seen_job_ids_.insert(job_id);
+    seen_job_order_.push_back(job_id);
+
     const auto external_id = random_id();
     auto job = std::make_shared<Job>();
     job->id = external_id;
+    job->laso_id = job_id;
+    job->sequence = next_job_sequence_++;
     jobs_[external_id] = job;
     jobs_by_laso_id_[job_id] = external_id;
     job->worker = std::jthread([this, job, request_id, job_id, capability, args = payload["arguments"]](std::stop_token stop) {

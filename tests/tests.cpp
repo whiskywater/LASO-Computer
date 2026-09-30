@@ -23,6 +23,16 @@ public:
     void shutdown() noexcept override {}
 };
 
+class SuccessProvider final : public laso::CapabilityProvider {
+public:
+    [[nodiscard]] laso::PluginIdentity identity() const override { return {"test.success", "1", "test provider", false}; }
+    [[nodiscard]] std::vector<laso::CapabilityDescriptor> capabilities() const override {
+        return {{"test.success", "test successful job", "test", nlohmann::json{{"type", "object"}}, true, {}}};
+    }
+    [[nodiscard]] nlohmann::json invoke(const laso::InvocationContext&) override { return {{"success", true}}; }
+    [[nodiscard]] bool health() const override { return true; }
+    void shutdown() noexcept override {}
+};
 class FailingProvider final : public laso::CapabilityProvider {
 public:
     [[nodiscard]] laso::PluginIdentity identity() const override { return {"test.failure", "1", "test provider", false}; }
@@ -228,6 +238,54 @@ void process_tests() {
             "allowlisted process timeout should be a valid TimedOut job result");
 }
 
+void lifetime_bound_tests() {
+    // Request replay protection is a rolling window, not a lifetime request cap.
+    laso::CapabilityRegistry replay_registry;
+    replay_registry.register_provider(std::make_shared<laso::WindowsPlatform>());
+    laso::WorkerProtocol replay_worker(laso::Config{}, std::move(replay_registry), laso::AuditLog{});
+    for (int i = 0; i < 4100; ++i) {
+        const auto response = replay_worker.handle(request("replay-" + std::to_string(i), "hello"));
+        require(response.value("ok", false), "request replay cache must evict old entries instead of bricking the worker");
+    }
+    require(replay_worker.handle(request("replay-0", "hello")).value("ok", false),
+            "oldest request id should be reusable after bounded replay eviction");
+    require(!replay_worker.handle(request("replay-4099", "hello")).value("ok", true),
+            "recent request id must still be rejected as a duplicate");
+
+    // Completed jobs must not count forever against the 64-active-job limit.
+    laso::Config config;
+    config.capabilities["test.success"] = laso::Decision::allow;
+    laso::CapabilityRegistry registry;
+    registry.register_provider(std::make_shared<SuccessProvider>());
+    laso::WorkerProtocol worker(config, std::move(registry), laso::AuditLog{});
+    std::string first_external_id;
+    for (int i = 0; i < 300; ++i) {
+        auto submit = request("lifetime-submit-" + std::to_string(i), "submit");
+        submit["job_id"] = "lifetime-job-" + std::to_string(i);
+        submit["payload"] = {{"capability", "test.success"}, {"arguments", nlohmann::json::object()}};
+        const auto accepted = worker.handle(submit);
+        require(accepted.value("ok", false), "completed jobs must not permanently exhaust the active-job limit");
+        const auto external_id = accepted.value("external_job_id", std::string{});
+        require(!external_id.empty(), "lifetime test should receive an external job id");
+        if (i == 0) first_external_id = external_id;
+
+        nlohmann::json result;
+        for (int poll = 0; poll < 100; ++poll) {
+            auto fetch = request("lifetime-result-" + std::to_string(i) + "-" + std::to_string(poll), "result");
+            fetch["external_job_id"] = external_id;
+            result = worker.handle(fetch);
+            if (result.value("state", std::string{}) != "Running") break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        require(result.value("ok", false) && result.value("state", std::string{}) == "Completed",
+                "lifetime test job should complete");
+    }
+    auto old_result = request("lifetime-old-result", "result");
+    old_result["external_job_id"] = first_external_id;
+    const auto evicted = worker.handle(old_result);
+    require(!evicted.value("ok", true) && evicted.value("error", std::string{}) == "job not found",
+            "old completed jobs should be evicted from bounded result retention");
+}
 void frame_tests() {
     laso::CapabilityRegistry registry;
     registry.register_provider(std::make_shared<laso::WindowsPlatform>());
@@ -288,6 +346,7 @@ int main() {
         failed_job_semantics_test();
         cancellation_test();
         process_tests();
+        lifetime_bound_tests();
         frame_tests();
         std::cout << "All LASO-Computer tests passed\n";
         return 0;
