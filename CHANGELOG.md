@@ -9,5 +9,6 @@
 - Added regression coverage for long worker lifetimes and strict broker RPC validation.
 - Diagnosed the current no-exemption Playwright attach failure as AppContainer loopback isolation (`ETIMEDOUT` to the validated local CDP endpoint); the 0.0.83 HTTP endpoint and port-0 Edge discovery pass outside AppContainer. The code reports this failure class without exposing endpoint details.
 - Changed unattended preflight to report loopback readiness and require an explicit `-CleanupLegacyLoopback` opt-in, since automatically removing the exemption would disable the currently tested AppContainer CDP path.
+- Aligned `LASOComputerBrokerCtl.exe preflight` with the same no-implicit-cleanup behavior and added `--require-loopback` for browser-dependent lanes.
 
 The broker service has not been installed or lifecycle-tested in an elevated session. The unattended preflight and non-privileged tests run without UAC. The browser fixture has been attempted after loopback-exemption cleanup; see [Playwright provider status](docs/playwright-provider.md) for the current result.

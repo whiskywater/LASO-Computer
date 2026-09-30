@@ -66,7 +66,7 @@ Json transact(std::string_view operation) {
     return parsed.at("result");
 }
 
-int print_preflight(bool require_cleanup) {
+int print_preflight(bool require_loopback) {
     std::cout << "LASO-Computer unattended preflight\n\n";
     try {
         const auto status = transact("query_status");
@@ -77,27 +77,26 @@ int print_preflight(bool require_cleanup) {
             throw std::runtime_error("broker version mismatch");
         std::cout << "Broker: OK\nProtocol: v" << status.at("broker_version").get<unsigned>() << "\nService: running\n";
         const auto loopback = transact("query_legacy_loopback");
-        const bool stale = loopback.value("enabled", false);
-        std::cout << "Required provisioning: " << (stale ? "legacy cleanup available" : "OK") << "\n"
-                  << "Playwright privileged setup: not required\n"
-                  << "Stale loopback exemption: " << (stale ? "present (cleanup_legacy_loopback is available)" : "none") << "\n"
+        const bool loopback_enabled = loopback.value("enabled", false);
+        std::cout << "Required provisioning: " << (loopback_enabled ? "OK" : "Playwright loopback unavailable") << "\n"
+                  << "Playwright loopback exemption: " << (loopback_enabled ? "present" : "absent; browser lane blocked") << "\n"
                   << "Interactive UAC expected: NO\n";
-        if (require_cleanup && stale) {
-            std::cout << "Unattended test readiness: BLOCKED (run the approved broker cleanup operation)\n";
+        if (require_loopback && !loopback_enabled) {
+            std::cout << "Unattended test readiness: BLOCKED (Playwright loopback is required)\n";
             return 2;
         }
-        std::cout << "Unattended test readiness: PASS\n";
+        std::cout << "Unattended test readiness: PASS for build/unit lanes; browser acceptance still requires its own test\n";
         return 0;
     } catch (const std::exception& error) {
         std::cout << "Broker: unavailable (" << error.what() << ")\n"
                   << "Protocol: unknown\nService: unavailable\n"
-                  << "Playwright privileged setup: not required\n"
+                  << "Playwright loopback exemption: UNKNOWN\n"
                   << "Interactive UAC expected: NO\n";
-        if (require_cleanup) {
-            std::cout << "Unattended test readiness: BLOCKED (required broker operation unavailable)\n";
+        if (require_loopback) {
+            std::cout << "Unattended test readiness: BLOCKED (required loopback state cannot be queried)\n";
             return 2;
         }
-        std::cout << "Unattended test readiness: PASS for non-privileged build/unit/browser lanes; privileged operations are unavailable\n";
+        std::cout << "Unattended test readiness: PASS for non-privileged build/unit lanes; browser loopback state is unknown\n";
         return 0;
     }
 }
@@ -106,15 +105,15 @@ int print_preflight(bool require_cleanup) {
 
 int wmain(int argc, wchar_t** argv) {
     if (argc < 2 || argc > 3) {
-        std::cerr << "Usage: LASOComputerBrokerCtl.exe <status|appcontainer-sid|legacy-loopback|cleanup-legacy-loopback|preflight> [--require-cleanup]\n";
+        std::cerr << "Usage: LASOComputerBrokerCtl.exe <status|appcontainer-sid|legacy-loopback|cleanup-legacy-loopback|preflight> [--require-loopback]\n";
         return 2;
     }
     const std::wstring command(argv[1]);
     try {
         if (command == L"preflight") {
-            const bool require_cleanup = argc == 3 && std::wstring_view(argv[2]) == L"--require-cleanup";
-            if (argc == 3 && !require_cleanup) return 2;
-            return print_preflight(require_cleanup);
+            const bool require_loopback = argc == 3 && std::wstring_view(argv[2]) == L"--require-loopback";
+            if (argc == 3 && !require_loopback) return 2;
+            return print_preflight(require_loopback);
         }
         if (argc != 2) return 2;
         std::string operation;
