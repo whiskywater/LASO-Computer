@@ -1,6 +1,6 @@
 # Roadmap and verified limitations
 
-This list separates implemented Windows behavior from blocked integrations. Build and desktop results must not be read as proof of current LASO interoperability or browser support.
+This list separates locally validated Windows behavior from unresolved publication/integration lanes. Browser tests are local acceptance evidence, not proof of current LASO interoperability or production readiness.
 
 ## Implemented in the current source
 
@@ -11,13 +11,13 @@ This list separates implemented Windows behavior from blocked integrations. Buil
 - Win32 screen capture, pointer and keyboard input, Unicode clipboard, visible window list/focus.
 - Bounded Windows UI Automation tree inspection and uniquely matched control invocation/value setting.
 - Direct restricted process execution with exact allowlist, explicit environment, bounded output, timeout/cancellation.
-- Playwright MCP adapter with bounded JSONL transport, exact tool allowlist, AppContainer/Job Object, C++-owned Edge with managed profile and loopback-only CDP. Browser operations remain blocked at Node `realpath` because the AppContainer cannot `lstat` the output path's ancestors; a narrow read-attributes/traverse test is pending user acceptance of the UAC prompt. The exact-version guarded named-pipe postinstall patch passed staged-copy/idempotence checks, but clean `npm ci` has not been tested because npm is unavailable on the host.
+- Playwright MCP 0.0.83 adapter with bounded JSON-RPC transport, fixed tool map, AppContainer/Job Object, C++-owned Edge, isolated profile, loopback CDP, and structured browser operations. The Node `realpath` root cause is Windows AppContainer DOS-volume path resolution; no broad filesystem ACE was added. The documented MCP unrestricted-file option is used while the OS AppContainer remains restrictive. Generated outside-file read/write and child process tests were denied. See `playwright-provider.md` for the exact tradeoff and evidence.
 
 ## Blocked acceptance items
 
 1. **LASO worker integration:** The inspected public LASO `main` commit `ef072429c96eb9b0964e56a561591a37ccb68fbd` did not contain a worker-process v1 contract or approval/request framing. The worker's protocol unit tests are not a substitute for integration. Repeat startup, submit, polling, failures, cancellation, endpoint policy, approval, and malformed/oversized frame acceptance after LASO publishes the contract.
-2. **Playwright:** Pinned 0.0.83 MCP supports CDP. C++ starts Edge with a unique managed profile and owns its process Job Object; the AppContainer MCP provider attaches to the PID-verified loopback endpoint and cannot create child processes. A temporary SID-specific loopback exemption and the guarded named-pipe postinstall patch made MCP initialize, tools/list, and `browser_tabs` attach probe pass. The first real browser operation remains blocked: Node `realpath` fails because AppContainer `lstat` is denied on absolute-path ancestors, including `C:\`. The current SID has traversal permission but not read-attributes permission. A narrow metadata/traverse ACL test is pending the user’s manual UAC acceptance; no broad read/data access is granted. The patch was tested against a staged copy, but clean npm install remains unverified. See [the investigation](playwright-provider.md). Complete the path/clean-install fix, remove the temporary loopback exemption, then run the full browser operation, outside-file/process denial, cancellation, crash, and cleanup lane.
-3. **Desktop automation stability:** The purpose-built interactive fixture has passed once but a later rerun intermittently failed to deliver keyboard text into the fixture control. Investigate foreground focus behavior and rerun repeatedly before calling keyboard input reliable.
+2. **Playwright cleanup/provisioning:** Local Debug and Release browser acceptance passed the deterministic fixture, including navigate, snapshot, fill, click, state change, select, tabs, screenshot, and local link navigation. HTTPS navigation to `example.com`, policy denial, cancellation, bounded navigation timeout, Edge crash, MCP crash, cleanup, and worker restart also passed locally. AppContainer outside-file and process launch denial passed. A temporary AppContainer-SID loopback exemption remains on the development host and requires one manual elevated removal. Clean `npm ci`/postinstall and hosted browser acceptance are not verified. The MCP option disables its own file-root guard, so preserve the exact OS ACL and fixed C++ capability map. Same-user CDP hijacking remains possible. See [the provider record](playwright-provider.md).
+3. **Desktop input/clipboard:** Debug and Release disposable-window smoke tests passed for the checks that Windows allowed. Keyboard/click operations were skipped because the foreground fixture did not receive focus; clipboard read/write was skipped because the clipboard was unavailable or held non-text data. Re-run those in a suitable interactive desktop session before claiming those paths validated.
 4. **Endpoint approvals:** No unsolicited request frame is sent. `require_approval` fails closed until a documented and proven correlated exchange is supported.
 5. **Remote endpoint:** No authenticated remote connection, enrollment, leases, reconnect, endpoint targeting, or server-mediated revocation. LASO must spawn the worker locally.
 
@@ -27,7 +27,7 @@ This list separates implemented Windows behavior from blocked integrations. Buil
 - Dynamic DLL plugins, install/sign/update lifecycle, or local pause/revoke UI.
 - Filesystem transfer and production packaging/signing.
 
-Do not mark the release production-ready until the integration blockers are cleared and the results are recorded against exact upstream commits.
+Do not mark the release production-ready until the LASO worker contract is validated, the temporary loopback exemption is removed, dependency provisioning and hosted CI are checked, and the skipped interactive input/clipboard tests pass in an appropriate session.
 
 ## Migration note
 

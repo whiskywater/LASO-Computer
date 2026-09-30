@@ -2,6 +2,7 @@
 param(
     [Parameter(Mandatory = $true)] [string] $ConfigPath,
     [string] $Executable = (Join-Path $PSScriptRoot '..\build\Debug\laso-computer.exe'),
+    [switch] $PolicyDenyOnly,
     [ValidateRange(1000, 120000)] [int] $TimeoutMs = 30000
 )
 
@@ -56,7 +57,7 @@ function Send-WorkerRequest([hashtable] $Request) {
     if ([string]::IsNullOrWhiteSpace($read.Result)) { throw "worker exited during $($Request.operation)" }
     return $read.Result | ConvertFrom-Json
 }
-function Invoke-BrowserCapability([string] $Name, [hashtable] $Arguments) {
+function Invoke-BrowserCapability([string] $Name, [hashtable] $Arguments, [switch] $AllowFailure) {
     $jobId = "browser-action-$script:counter"
     $submitted = Send-WorkerRequest @{ protocol_version = 1; operation = 'submit'; job_id = $jobId; payload = @{ capability = $Name; arguments = $Arguments } }
     if (-not $submitted.ok -or $submitted.state -ne 'Running') { throw "submit failed for $Name" }
@@ -68,7 +69,10 @@ function Invoke-BrowserCapability([string] $Name, [hashtable] $Arguments) {
     } while ($status.state -eq 'Running' -and [DateTime]::UtcNow -lt $deadline)
     if ($status.state -eq 'Running') { throw "job timed out: $Name" }
     $result = Send-WorkerRequest @{ protocol_version = 1; operation = 'result'; external_job_id = $submitted.external_job_id }
-    if (-not $result.ok -or $result.state -ne 'Completed') { throw "capability failed: $Name ($($result.state), $($result.error))" }
+    if (-not $result.ok -or $result.state -ne 'Completed') {
+        if ($AllowFailure) { return $result }
+        throw "capability failed: $Name ($($result.state), $($result.error))"
+    }
     return $result.payload
 }
 
@@ -90,6 +94,15 @@ try {
     $unavailable = @($hello.payload.capabilities | Where-Object { $_.name -like 'browser.*' -and $_.available -ne $true })
     if ($unavailable.Count) { throw "browser provider unavailable: $(($unavailable.name) -join ', ')" }
 
+    if ($PolicyDenyOnly) {
+        $denied = Invoke-BrowserCapability 'browser.navigate' @{ url = 'https://example.com/' } -AllowFailure
+        if (-not $denied.ok -or $denied.state -ne 'Failed' -or $denied.error -ne 'capability denied') {
+            throw "endpoint policy did not deny browser.navigate (ok=$($denied.ok), state=$($denied.state), error=$($denied.error))"
+        }
+        Write-Host 'PASS installed provider does not bypass endpoint deny policy'
+        return
+    }
+
     $url = "http://127.0.0.1:$fixturePort/"
     Invoke-BrowserCapability 'browser.navigate' @{ url = $url } | Out-Null
     Write-Host 'PASS browser.navigate local fixture'
@@ -97,19 +110,30 @@ try {
     $snapshotText = $snapshot.content | ForEach-Object { $_.text } | Out-String
     if ($snapshotText -notmatch 'LASO Browser Fixture' -or $snapshotText -notmatch 'Name') { throw 'fixture snapshot did not contain expected DOM text' }
     Write-Host 'PASS browser.snapshot fixture DOM'
-    Invoke-BrowserCapability 'browser.fill' @{ target = 'Name'; text = 'Ada' } | Out-Null
-    Invoke-BrowserCapability 'browser.click' @{ target = 'Submit' } | Out-Null
+
+    $directFile = Invoke-BrowserCapability 'browser.navigate' @{ url = 'file:///C:/Users/Public/laso-test-only-nonexistent.txt' } -AllowFailure
+    if (-not $directFile.ok -or $directFile.state -ne 'Failed') {
+        throw "direct file:// navigation was not rejected by C++ URL validator (ok=$($directFile.ok), state=$($directFile.state), error=$($directFile.error))"
+    }
+    Write-Host 'PASS C++ rejects direct file:// navigation'
+    $nameRef = [regex]::Match($snapshotText, '(?m)textbox "Name".*\[ref=(e\d+)\]')
+    $submitRef = [regex]::Match($snapshotText, '(?m)button "Submit".*\[ref=(e\d+)\]')
+    $choiceRef = [regex]::Match($snapshotText, '(?m)combobox "Choice".*\[ref=(e\d+)\]')
+    $secondRef = [regex]::Match($snapshotText, '(?m)link "Second page".*\[ref=(e\d+)\]')
+    if (-not $nameRef.Success -or -not $submitRef.Success -or -not $choiceRef.Success -or -not $secondRef.Success) { throw 'fixture snapshot was missing an expected control reference' }
+    Invoke-BrowserCapability 'browser.fill' @{ target = $nameRef.Groups[1].Value; text = 'Ada' } | Out-Null
+    Invoke-BrowserCapability 'browser.click' @{ target = $submitRef.Groups[1].Value } | Out-Null
     $afterClick = Invoke-BrowserCapability 'browser.snapshot' @{}
     $afterText = $afterClick.content | ForEach-Object { $_.text } | Out-String
     if ($afterText -notmatch 'Hello Ada') { throw 'click/fill did not update fixture state' }
     Write-Host 'PASS browser.fill and browser.click state change'
-    Invoke-BrowserCapability 'browser.select' @{ target = 'Choice'; value = 'two' } | Out-Null
+    Invoke-BrowserCapability 'browser.select' @{ target = $choiceRef.Groups[1].Value; value = 'two' } | Out-Null
     $tabs = Invoke-BrowserCapability 'browser.tabs' @{ action = 'list' }
     $screenshot = Invoke-BrowserCapability 'browser.screenshot' @{}
     $images = @($screenshot.content | Where-Object { $_.type -eq 'image' }).Count
     if ($images -eq 0) { throw 'browser screenshot did not return an image' }
     Write-Host 'PASS browser.select, tabs, and screenshot'
-    Invoke-BrowserCapability 'browser.click' @{ target = 'Second page' } | Out-Null
+    Invoke-BrowserCapability 'browser.click' @{ target = $secondRef.Groups[1].Value } | Out-Null
     $secondSnapshot = Invoke-BrowserCapability 'browser.snapshot' @{}
     $secondText = $secondSnapshot.content | ForEach-Object { $_.text } | Out-String
     if ($secondText -notmatch 'Second page') { throw 'fixture link navigation failed' }

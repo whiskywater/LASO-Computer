@@ -483,11 +483,14 @@ struct PlaywrightMcpProvider::Impl {
         startup.StartupInfo.hStdOutput = child_output.get();
         startup.StartupInfo.hStdError = child_stderr.get();
         startup.lpAttributeList = attributes;
-        // Node realpaths the main CommonJS entry by default, which probes the
-        // volume root. Preserve the configured main/dependency paths instead;
-        // never grant the AppContainer access to the volume root for this.
+        // In Node/libuv on Windows AppContainer, realpath's GetFinalPathNameByHandleW
+        // DOS-volume translation is denied even for AppContainer-owned output paths.
+        // MCP 0.0.83's documented flag skips that workspace/file canonicalization
+        // guard. The OS AppContainer ACL, one-process Job Object, and this adapter's
+        // fixed typed tools remain the enforcement boundary; do not grant C:\ access.
         std::wstring command = quote(node.native()) + L" --preserve-symlinks --preserve-symlinks-main " + quote(server.native()) +
             L" --config " + quote(provider_config.native()) + L" --no-webmcp --output-dir " + quote(plugin_temp.native()) +
+            L" --allow-unrestricted-file-access" +
             L" --timeout-action 5000 --timeout-navigation 20000 --output-max-size 1048576";
         std::vector<wchar_t> mutable_command(command.begin(), command.end()); mutable_command.push_back(L'\0');
         auto environment = safe_environment(plugin_temp);
@@ -657,8 +660,9 @@ struct PlaywrightMcpProvider::Impl {
 
     nlohmann::json call(std::string tool, nlohmann::json args, const InvocationContext& invocation) {
         std::scoped_lock guard(lock);
-        if (!healthy || !process || WaitForSingleObject(process.get(), 0) == WAIT_OBJECT_0) {
+        if (!healthy || !process || WaitForSingleObject(process.get(), 0) == WAIT_OBJECT_0 || !browser || !browser->healthy()) {
             healthy = false;
+            stop();
             throw std::runtime_error("capability unavailable");
         }
         const auto id = next_id++;
@@ -676,7 +680,14 @@ struct PlaywrightMcpProvider::Impl {
         }
         if (response.contains("error") || !response.contains("result")) throw std::runtime_error("Playwright provider request failed");
         const auto& result = response.at("result");
-        if (result.value("isError", false)) throw std::runtime_error("Playwright browser action failed: " + result.dump().substr(0, 1024));
+        if (result.value("isError", false)) {
+            if (!browser || !browser->healthy()) {
+                healthy = false;
+                stop();
+                throw std::runtime_error("managed browser exited during browser action");
+            }
+            throw std::runtime_error("Playwright browser action failed: " + result.dump().substr(0, 1024));
+        }
         if (result.contains("content") && result["content"].dump().size() > max_frame_bytes - 4096)
             throw std::runtime_error("Playwright result exceeds bounded output size");
         return {{"plugin", "playwright.mcp"}, {"content", result.value("content", nlohmann::json::array())}};
@@ -726,7 +737,7 @@ std::vector<CapabilityDescriptor> PlaywrightMcpProvider::capabilities() const {
         return result;
     };
     const auto string = [](int maximum = 4096) { return Json{{"type", "string"}, {"maxLength", maximum}}; };
-    const bool running = impl_ && impl_->healthy;
+    const bool running = health();
     return {
         {"browser.navigate", "Navigate the isolated Playwright browser to an HTTP(S) URL", "network_write",
             schema(Json{{"url", string(8192)}}, {"url"}), running, {}},
@@ -799,7 +810,17 @@ nlohmann::json PlaywrightMcpProvider::invoke(const InvocationContext& invocation
     return impl_->call(std::move(tool), std::move(mapped), invocation);
 }
 
-bool PlaywrightMcpProvider::health() const { return impl_ && impl_->healthy && impl_->process && WaitForSingleObject(impl_->process.get(), 0) == WAIT_TIMEOUT; }
+bool PlaywrightMcpProvider::health() const {
+    if (!impl_) return false;
+    std::scoped_lock guard(impl_->lock);
+    const bool running = impl_->healthy && impl_->process && WaitForSingleObject(impl_->process.get(), 0) == WAIT_TIMEOUT &&
+        impl_->browser && impl_->browser->healthy();
+    if (!running) {
+        impl_->healthy = false;
+        impl_->stop();
+    }
+    return running;
+}
 std::string PlaywrightMcpProvider::status_detail() const {
     if (!impl_ || impl_->healthy) return "ready";
     std::scoped_lock guard(impl_->diagnostics_lock);
