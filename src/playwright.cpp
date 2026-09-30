@@ -1,10 +1,13 @@
 #include "laso/playwright.hpp"
 #include "laso/protocol.hpp"
 
+#include <WinSock2.h>
 #include <Windows.h>
 #include <Aclapi.h>
 #include <sddl.h>
 #include <userenv.h>
+#include <winhttp.h>
+#include <iphlpapi.h>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -75,7 +78,7 @@ bool safe_path(const std::filesystem::path& path, bool directory) {
     return true;
 }
 
-void grant_appcontainer_access(const std::filesystem::path& path, PSID sid, DWORD mask) {
+void grant_appcontainer_access(const std::filesystem::path& path, PSID sid, DWORD mask, DWORD inheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT) {
     PSECURITY_DESCRIPTOR descriptor = nullptr;
     PACL old_acl = nullptr;
     const auto get_result = GetNamedSecurityInfoW(path.c_str(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
@@ -84,7 +87,7 @@ void grant_appcontainer_access(const std::filesystem::path& path, PSID sid, DWOR
     EXPLICIT_ACCESSW access{};
     access.grfAccessPermissions = mask;
     access.grfAccessMode = GRANT_ACCESS;
-    access.grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+    access.grfInheritance = inheritance;
     access.Trustee.TrusteeForm = TRUSTEE_IS_SID;
     access.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
     access.Trustee.ptstrName = static_cast<LPWSTR>(sid);
@@ -132,18 +135,187 @@ std::wstring environment_value(const wchar_t* name) {
 
 std::vector<wchar_t> safe_environment(const std::filesystem::path& temp_path) {
     std::vector<std::wstring> entries;
-    for (const auto* variable : {L"SystemRoot", L"WINDIR", L"LOCALAPPDATA", L"ProgramFiles", L"ProgramFiles(x86)"}) {
+    for (const auto* variable : {L"SystemRoot", L"WINDIR", L"ProgramFiles", L"ProgramFiles(x86)"}) {
         const auto value = environment_value(variable);
         if (!value.empty()) entries.push_back(std::wstring(variable) + L"=" + value);
     }
+    const auto local_app_data = environment_value(L"LOCALAPPDATA");
+    if (!local_app_data.empty()) entries.push_back(L"LOCALAPPDATA=" + local_app_data);
     entries.push_back(L"TEMP=" + temp_path.wstring());
     entries.push_back(L"TMP=" + temp_path.wstring());
+    entries.push_back(L"PLAYWRIGHT_BROWSERS_PATH=" + temp_path.wstring());
+    // Playwright 1.64 names its Windows browser IPC pipe from the browser
+    // guid and this optional namespace salt. A per-run salt prevents another
+    // local Playwright host from occupying the same predictable pipe name.
+    entries.push_back(L"PWTEST_SOCKETS_DIR=" + temp_path.wstring());
     std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) { return _wcsicmp(a.c_str(), b.c_str()) < 0; });
     std::vector<wchar_t> block;
     for (const auto& entry : entries) { block.insert(block.end(), entry.begin(), entry.end()); block.push_back(L'\0'); }
     block.push_back(L'\0');
     return block;
 }
+
+std::vector<wchar_t> browser_environment(const std::filesystem::path& run_path) {
+    std::vector<std::wstring> entries;
+    for (const auto* variable : {L"SystemRoot", L"WINDIR", L"LOCALAPPDATA", L"ProgramFiles", L"ProgramFiles(x86)", L"USERPROFILE", L"APPDATA"}) {
+        const auto value = environment_value(variable);
+        if (!value.empty()) entries.push_back(std::wstring(variable) + L"=" + value);
+    }
+    const auto system_root = environment_value(L"SystemRoot");
+    if (!system_root.empty()) entries.push_back(L"PATH=" + system_root + L"\\System32;" + system_root);
+    entries.push_back(L"TEMP=" + run_path.wstring());
+    entries.push_back(L"TMP=" + run_path.wstring());
+    std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) { return _wcsicmp(a.c_str(), b.c_str()) < 0; });
+    std::vector<wchar_t> block;
+    for (const auto& entry : entries) { block.insert(block.end(), entry.begin(), entry.end()); block.push_back(L'\0'); }
+    block.push_back(L'\0');
+    return block;
+}
+
+unsigned short allocate_loopback_port() {
+    WSADATA data{};
+    if (WSAStartup(MAKEWORD(2, 2), &data) != 0) throw std::runtime_error("browser endpoint setup failed");
+    SOCKET socket = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, nullptr, 0, WSA_FLAG_NO_HANDLE_INHERIT);
+    if (socket == INVALID_SOCKET) { WSACleanup(); throw std::runtime_error("browser endpoint setup failed"); }
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    const bool bound = bind(socket, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0;
+    int length = sizeof(address);
+    if (!bound || getsockname(socket, reinterpret_cast<sockaddr*>(&address), &length) != 0) {
+        closesocket(socket); WSACleanup(); throw std::runtime_error("browser endpoint setup failed");
+    }
+    const auto port = ntohs(address.sin_port);
+    closesocket(socket);
+    WSACleanup();
+    return port;
+}
+
+std::string http_get_localhost(unsigned short port, const wchar_t* path) {
+    HINTERNET session = WinHttpOpen(L"LASO-Computer/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY,
+                                    WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!session) throw std::runtime_error("browser endpoint health check failed");
+    HINTERNET connection = WinHttpConnect(session, L"127.0.0.1", port, 0);
+    HINTERNET request = connection ? WinHttpOpenRequest(connection, L"GET", path, nullptr,
+        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0) : nullptr;
+    DWORD timeout = 1000;
+    if (request) {
+        WinHttpSetOption(request, WINHTTP_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(timeout));
+        WinHttpSetOption(request, WINHTTP_OPTION_SEND_TIMEOUT, &timeout, sizeof(timeout));
+        WinHttpSetOption(request, WINHTTP_OPTION_RECEIVE_TIMEOUT, &timeout, sizeof(timeout));
+    }
+    const bool sent = request && WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+        WINHTTP_NO_REQUEST_DATA, 0, 0, 0) && WinHttpReceiveResponse(request, nullptr);
+    std::string result;
+    if (sent) {
+        std::array<char, 4096> buffer{};
+        for (;;) {
+            DWORD available = 0;
+            if (!WinHttpQueryDataAvailable(request, &available) || available == 0) break;
+            if (available > 65536U - result.size()) { result.clear(); break; }
+            DWORD read = 0;
+            if (!WinHttpReadData(request, buffer.data(), static_cast<DWORD>(std::min<std::size_t>(buffer.size(), available)), &read)) { result.clear(); break; }
+            result.append(buffer.data(), read);
+        }
+    }
+    if (request) WinHttpCloseHandle(request);
+    if (connection) WinHttpCloseHandle(connection);
+    WinHttpCloseHandle(session);
+    return result;
+}
+
+bool loopback_listener_owned_by(unsigned short port, DWORD pid) {
+    ULONG bytes = 0;
+    if (GetExtendedTcpTable(nullptr, &bytes, FALSE, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0) != ERROR_INSUFFICIENT_BUFFER || bytes == 0)
+        return false;
+    std::vector<std::byte> storage(bytes);
+    const auto* table = reinterpret_cast<const MIB_TCPTABLE_OWNER_PID*>(storage.data());
+    if (GetExtendedTcpTable(storage.data(), &bytes, FALSE, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0) != NO_ERROR)
+        return false;
+    for (DWORD i = 0; i < table->dwNumEntries; ++i) {
+        const auto& row = table->table[i];
+        if (row.dwLocalAddr == htonl(INADDR_LOOPBACK) && ntohs(static_cast<u_short>(row.dwLocalPort)) == port && row.dwOwningPid == pid)
+            return true;
+    }
+    return false;
+}
+
+class BrowserProcess {
+public:
+    BrowserProcess(const std::filesystem::path& executable, const std::filesystem::path& run_path)
+        : run_path_(run_path), profile_(run_path / L"profile"), port_(allocate_loopback_port()) {
+        std::error_code error;
+        if (!std::filesystem::create_directory(profile_, error) || error || !safe_path(profile_, true))
+            throw std::runtime_error("isolated browser profile could not be created");
+        const auto log_file = run_path_ / L"edge.log";
+        const auto command = quote(executable.native()) + L" --headless=new --no-first-run --no-default-browser-check --disable-extensions --disable-sync --disable-features=msEdgeSidebarV2 " +
+            L"--enable-logging --log-file=" + quote(log_file.native()) + L" --user-data-dir=" + quote(profile_.native()) +
+            L" --remote-debugging-address=127.0.0.1 --remote-debugging-port=" + std::to_wstring(port_) + L" about:blank";
+        std::vector<wchar_t> mutable_command(command.begin(), command.end()); mutable_command.push_back(L'\0');
+        auto environment = browser_environment(run_path_);
+        STARTUPINFOW startup{};
+        startup.cb = sizeof(startup);
+        PROCESS_INFORMATION info{};
+        if (!CreateProcessW(executable.c_str(), mutable_command.data(), nullptr, nullptr, FALSE,
+                CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
+                environment.data(), run_path_.c_str(), &startup, &info))
+            throw std::runtime_error("managed Edge process could not start");
+        process_.reset(info.hProcess);
+        Handle thread(info.hThread);
+        job_.reset(CreateJobObjectW(nullptr, nullptr));
+        if (!job_) { TerminateProcess(process_.get(), 1); throw std::runtime_error("browser process isolation failed"); }
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+        limits.BasicLimitInformation.ActiveProcessLimit = 32;
+        limits.ProcessMemoryLimit = 2ULL * 1024ULL * 1024ULL * 1024ULL;
+        if (!SetInformationJobObject(job_.get(), JobObjectExtendedLimitInformation, &limits, sizeof(limits)) ||
+            !AssignProcessToJobObject(job_.get(), process_.get())) {
+            TerminateProcess(process_.get(), 1); throw std::runtime_error("browser process isolation failed");
+        }
+        if (ResumeThread(thread.get()) == static_cast<DWORD>(-1)) throw std::runtime_error("managed Edge process could not start");
+        wait_for_ready();
+    }
+    ~BrowserProcess() { stop(); }
+    BrowserProcess(const BrowserProcess&) = delete;
+    BrowserProcess& operator=(const BrowserProcess&) = delete;
+    [[nodiscard]] unsigned short port() const noexcept { return port_; }
+    [[nodiscard]] const std::filesystem::path& profile() const noexcept { return profile_; }
+    [[nodiscard]] bool healthy() const noexcept { return process_ && WaitForSingleObject(process_.get(), 0) == WAIT_TIMEOUT; }
+    void stop() noexcept {
+        if (job_) TerminateJobObject(job_.get(), 0);
+        else if (process_) TerminateProcess(process_.get(), 0);
+        if (process_) WaitForSingleObject(process_.get(), 2000);
+        job_.reset(); process_.reset();
+    }
+private:
+    void wait_for_ready() {
+        const auto deadline = GetTickCount64() + 30000;
+        while (GetTickCount64() < deadline) {
+            if (!healthy()) throw std::runtime_error("managed Edge exited during startup");
+            const auto body = http_get_localhost(port_, L"/json/version");
+            const auto version = nlohmann::json::parse(body, nullptr, false);
+            const auto websocket = version.is_object() ? version.value("webSocketDebuggerUrl", std::string{}) : std::string{};
+            if (version.is_object() &&
+                version.value("Browser", std::string{}).starts_with("Edg/") &&
+                websocket.starts_with("ws://127.0.0.1:" + std::to_string(port_) + "/devtools/browser/") &&
+                loopback_listener_owned_by(port_, GetProcessId(process_.get()))) return;
+            Sleep(100);
+        }
+        std::string detail = "managed Edge CDP endpoint did not become ready (port=" + std::to_string(port_) +
+            ", owned-listener=" + (loopback_listener_owned_by(port_, GetProcessId(process_.get())) ? "yes" : "no") + ")";
+        std::ifstream log(log_file_, std::ios::binary);
+        if (log) {
+            std::string contents((std::istreambuf_iterator<char>(log)), std::istreambuf_iterator<char>());
+            if (contents.size() > 4096) contents.erase(0, contents.size() - 4096);
+            if (!contents.empty()) detail += ": " + contents;
+        }
+        throw std::runtime_error(detail);
+    }
+    std::filesystem::path run_path_, profile_, log_file_{run_path_ / L"edge.log"};
+    unsigned short port_{};
+    Handle process_, job_;
+};
 
 std::string lower(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
@@ -161,11 +333,14 @@ struct PlaywrightMcpProvider::Impl {
 
     Config::Playwright config;
     Handle process, job, input, output, stderr_output;
+    std::unique_ptr<BrowserProcess> browser;
     std::vector<std::byte> attributes_storage;
     PPROC_THREAD_ATTRIBUTE_LIST attributes{};
     PSID appcontainer_sid{};
     PSID internet_sid{};
     std::filesystem::path plugin_temp;
+    std::filesystem::path appcontainer_local;
+    std::filesystem::path browser_run;
     std::vector<std::filesystem::path> acl_paths;
     std::mutex lock;
     std::mutex diagnostics_lock;
@@ -179,8 +354,8 @@ struct PlaywrightMcpProvider::Impl {
     ~Impl() { stop(); }
 
     void start() {
-        const std::filesystem::path node(config.node_executable), server(config.server_entry), browser(config.browser_executable);
-        if (!safe_path(node, false) || !safe_path(server, false) || !safe_path(browser, false))
+        const std::filesystem::path node(config.node_executable), server(config.server_entry), browser_executable(config.browser_executable);
+        if (!safe_path(node, false) || !safe_path(server, false) || !safe_path(browser_executable, false))
             throw std::runtime_error("configured Playwright runtime paths must be existing non-reparse paths");
         const auto package_manifest = server.parent_path() / L"package.json";
         if (!safe_path(package_manifest, false)) throw std::runtime_error("configured Playwright package is invalid");
@@ -193,29 +368,6 @@ struct PlaywrightMcpProvider::Impl {
             throw std::runtime_error("Playwright provider package version is not the tested 0.0.83 release");
         const auto local = environment_value(L"LOCALAPPDATA");
         if (local.empty()) throw std::runtime_error("Playwright plugin unavailable");
-        const auto plugin_root = std::filesystem::path(local) / L"LASO-Computer" / L"plugin-temp";
-        std::error_code ec;
-        std::filesystem::create_directories(plugin_root, ec);
-        if (ec || !safe_path(plugin_root, true)) throw std::runtime_error("Playwright plugin unavailable");
-        GUID temp_id{};
-        wchar_t temp_name[40]{};
-        if (FAILED(CoCreateGuid(&temp_id)) || StringFromGUID2(temp_id, temp_name, static_cast<int>(std::size(temp_name))) == 0)
-            throw std::runtime_error("Playwright plugin unavailable");
-        plugin_temp = plugin_root / temp_name;
-        if (!std::filesystem::create_directory(plugin_temp, ec) || ec || !safe_path(plugin_temp, true))
-            throw std::runtime_error("Playwright plugin unavailable");
-        const auto browser_profile = plugin_temp / L"browser-profile";
-        const auto provider_config = plugin_temp / L"provider-config.json";
-        {
-            std::ofstream config_stream(provider_config, std::ios::binary | std::ios::trunc);
-            const auto config_json = nlohmann::json{
-                {"browser", {{"isolated", false}, {"userDataDir", utf8(browser_profile.wstring())}}}
-            }.dump();
-            config_stream.write(config_json.data(), static_cast<std::streamsize>(config_json.size()));
-            config_stream.flush();
-            if (!config_stream) throw std::runtime_error("Playwright plugin configuration failed");
-        }
-
         PSID app_sid_raw = nullptr;
         const auto profile = CreateAppContainerProfile(L"LASOComputer.Playwright", L"LASO-Computer Playwright", L"Isolated LASO-Computer browser adapter", nullptr, 0, &app_sid_raw);
         if (SUCCEEDED(profile)) appcontainer_sid = app_sid_raw;
@@ -223,25 +375,73 @@ struct PlaywrightMcpProvider::Impl {
             if (FAILED(DeriveAppContainerSidFromAppContainerName(L"LASOComputer.Playwright", &appcontainer_sid)))
                 throw std::runtime_error("Playwright plugin isolation setup failed");
         } else throw std::runtime_error("Playwright AppContainer profile unavailable");
-        if (!ConvertStringSidToSidW(L"S-1-15-3-1", &internet_sid)) throw std::runtime_error("Playwright internet capability unavailable");
-
+        LPWSTR appcontainer_sid_text = nullptr;
+        PWSTR appcontainer_folder = nullptr;
+        if (!ConvertSidToStringSidW(appcontainer_sid, &appcontainer_sid_text) ||
+            FAILED(GetAppContainerFolderPath(appcontainer_sid_text, &appcontainer_folder))) {
+            if (appcontainer_sid_text) LocalFree(appcontainer_sid_text);
+            throw std::runtime_error("Playwright AppContainer data directory unavailable");
+        }
+        appcontainer_local = appcontainer_folder;
+        LocalFree(appcontainer_sid_text);
+        CoTaskMemFree(appcontainer_folder);
+        const auto managed_root = std::filesystem::path(local) / L"LASO-Computer";
+        // Playwright's Windows server registry uses LOCALAPPDATA\ms-playwright\b
+        // even when attaching through CDP. For an AppContainer, Windows maps
+        // LOCALAPPDATA to this package's AC directory. Provision that cache
+        // path and keep all provider output beneath the same managed subtree.
+        const auto playwright_root = appcontainer_local / L"ms-playwright";
+        const auto plugin_root = playwright_root / L"LASO-Computer" / L"plugin-temp";
+        const auto browser_root = managed_root / L"browser-runs";
+        std::error_code ec;
+        std::filesystem::create_directories(playwright_root / L"b", ec);
+        if (ec || !safe_path(playwright_root / L"b", true)) throw std::runtime_error("Playwright plugin unavailable");
+        std::filesystem::create_directories(plugin_root, ec);
+        if (ec || !safe_path(plugin_root, true)) throw std::runtime_error("Playwright plugin unavailable");
+        std::filesystem::create_directories(browser_root, ec);
+        if (ec || !safe_path(browser_root, true)) throw std::runtime_error("Playwright browser runtime unavailable");
+        GUID temp_id{};
+        wchar_t temp_name[40]{};
+        if (FAILED(CoCreateGuid(&temp_id)) || StringFromGUID2(temp_id, temp_name, static_cast<int>(std::size(temp_name))) == 0)
+            throw std::runtime_error("Playwright plugin unavailable");
+        plugin_temp = plugin_root / temp_name;
+        if (!std::filesystem::create_directory(plugin_temp, ec) || ec || !safe_path(plugin_temp, true))
+            throw std::runtime_error("Playwright plugin unavailable");
+        GUID browser_id{};
+        wchar_t browser_name[40]{};
+        if (FAILED(CoCreateGuid(&browser_id)) || StringFromGUID2(browser_id, browser_name, static_cast<int>(std::size(browser_name))) == 0)
+            throw std::runtime_error("Playwright browser runtime unavailable");
+        browser_run = browser_root / browser_name;
+        if (!std::filesystem::create_directory(browser_run, ec) || ec || !safe_path(browser_run, true))
+            throw std::runtime_error("Playwright browser runtime unavailable");
+        browser = std::make_unique<BrowserProcess>(browser_executable, browser_run);
+        const auto provider_config = plugin_temp / L"provider-config.json";
+        {
+            std::ofstream config_stream(provider_config, std::ios::binary | std::ios::trunc);
+            const auto config_json = nlohmann::json{
+                {"browser", {{"cdpEndpoint", "http://127.0.0.1:" + std::to_string(browser->port())}, {"cdpTimeout", 10000}}}
+            }.dump();
+            config_stream.write(config_json.data(), static_cast<std::streamsize>(config_json.size()));
+            config_stream.flush();
+            if (!config_stream) throw std::runtime_error("Playwright plugin configuration failed");
+        }
         const auto node_directory = node.parent_path();
-        const auto browser_directory = browser.parent_path();
         auto package_directory = server.parent_path();
         for (auto parent = package_directory; !parent.empty(); parent = parent.parent_path()) {
             if (_wcsicmp(parent.filename().c_str(), L"node_modules") == 0) { package_directory = parent; break; }
             if (parent == parent.root_path()) break;
         }
-        if (!safe_path(node_directory, true) || !safe_path(package_directory, true) || !safe_path(browser_directory, true))
+        if (!safe_path(node_directory, true) || !safe_path(package_directory, true))
             throw std::runtime_error("Playwright plugin directories must be existing non-reparse directories");
         const auto read_execute = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | FILE_LIST_DIRECTORY | FILE_TRAVERSE;
-        const auto grant_once = [this](const std::filesystem::path& path, DWORD mask) {
+        const auto grant_once = [this](const std::filesystem::path& path, DWORD mask, DWORD inheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT) {
             if (std::find(acl_paths.begin(), acl_paths.end(), path) != acl_paths.end()) return;
-            grant_appcontainer_access(path, appcontainer_sid, mask);
+            grant_appcontainer_access(path, appcontainer_sid, mask, inheritance);
             acl_paths.push_back(path);
         };
         grant_once(node_directory, read_execute);
         grant_once(package_directory, read_execute);
+        grant_once(server.parent_path(), read_execute);
         // Installed Edge under Program Files already grants read/execute to
         // ALL APPLICATION PACKAGES. Do not alter its ACL from the endpoint.
         grant_appcontainer_access(plugin_temp, appcontainer_sid, FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | FILE_LIST_DIRECTORY | FILE_TRAVERSE | DELETE);
@@ -272,8 +472,7 @@ struct PlaywrightMcpProvider::Impl {
         HANDLE inherited_handles[]{child_input.get(), child_output.get(), child_stderr.get()};
         if (!UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited_handles, sizeof(inherited_handles), nullptr, nullptr))
             throw std::runtime_error("Playwright plugin process setup failed");
-        SID_AND_ATTRIBUTES capability{internet_sid, SE_GROUP_ENABLED};
-        SECURITY_CAPABILITIES security{appcontainer_sid, &capability, 1, 0};
+        SECURITY_CAPABILITIES security{appcontainer_sid, nullptr, 0, 0};
         if (!UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, &security, sizeof(security), nullptr, nullptr))
             throw std::runtime_error("Playwright AppContainer permission setup failed");
 
@@ -288,8 +487,7 @@ struct PlaywrightMcpProvider::Impl {
         // volume root. Preserve the configured main/dependency paths instead;
         // never grant the AppContainer access to the volume root for this.
         std::wstring command = quote(node.native()) + L" --preserve-symlinks --preserve-symlinks-main " + quote(server.native()) +
-            L" --browser msedge --headless --config " + quote(provider_config.native()) + L" --no-webmcp --output-dir " + quote(plugin_temp.native()) +
-            L" --executable-path " + quote(browser.native()) +
+            L" --config " + quote(provider_config.native()) + L" --no-webmcp --output-dir " + quote(plugin_temp.native()) +
             L" --timeout-action 5000 --timeout-navigation 20000 --output-max-size 1048576";
         std::vector<wchar_t> mutable_command(command.begin(), command.end()); mutable_command.push_back(L'\0');
         auto environment = safe_environment(plugin_temp);
@@ -298,7 +496,7 @@ struct PlaywrightMcpProvider::Impl {
         if (!CreateProcessW(node.c_str(), mutable_command.data(), nullptr, nullptr, TRUE,
                 CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT,
                 environment.data(), cwd.c_str(), &startup.StartupInfo, &info))
-            throw std::runtime_error("Playwright plugin process could not start");
+            throw std::runtime_error("Playwright plugin process could not start (win32=" + std::to_string(GetLastError()) + ")");
         process.reset(info.hProcess);
         Handle thread(info.hThread);
         child_input.reset(); child_output.reset(); child_stderr.reset();
@@ -306,7 +504,9 @@ struct PlaywrightMcpProvider::Impl {
         if (!job) { TerminateProcess(process.get(), 1); throw std::runtime_error("Playwright plugin isolation failed"); }
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
-        limits.BasicLimitInformation.ActiveProcessLimit = 16;
+        // The attached MCP provider must not create its own browser or any
+        // other child process. The C++ runtime owns Edge in a separate job.
+        limits.BasicLimitInformation.ActiveProcessLimit = 1;
         limits.ProcessMemoryLimit = 512U * 1024U * 1024U;
         if (!SetInformationJobObject(job.get(), JobObjectExtendedLimitInformation, &limits, sizeof(limits)) ||
             !AssignProcessToJobObject(job.get(), process.get())) {
@@ -452,7 +652,7 @@ struct PlaywrightMcpProvider::Impl {
         const auto browser_response = receive_response(browser_id, {}, GetTickCount64() + 10000);
         if (browser_response.contains("error") || !browser_response.contains("result") ||
             browser_response.at("result").value("isError", false))
-            throw std::runtime_error("Playwright browser failed its startup probe");
+            throw std::runtime_error("Playwright MCP could not attach to the managed browser");
     }
 
     nlohmann::json call(std::string tool, nlohmann::json args, const InvocationContext& invocation) {
@@ -476,7 +676,7 @@ struct PlaywrightMcpProvider::Impl {
         }
         if (response.contains("error") || !response.contains("result")) throw std::runtime_error("Playwright provider request failed");
         const auto& result = response.at("result");
-        if (result.value("isError", false)) throw std::runtime_error("Playwright browser action failed");
+        if (result.value("isError", false)) throw std::runtime_error("Playwright browser action failed: " + result.dump().substr(0, 1024));
         if (result.contains("content") && result["content"].dump().size() > max_frame_bytes - 4096)
             throw std::runtime_error("Playwright result exceeds bounded output size");
         return {{"plugin", "playwright.mcp"}, {"content", result.value("content", nlohmann::json::array())}};
@@ -489,6 +689,7 @@ struct PlaywrightMcpProvider::Impl {
         if (process) WaitForSingleObject(process.get(), 2000);
         job.reset(); process.reset(); output.reset(); stderr_output.reset();
         if (stderr_reader.joinable()) stderr_reader.join();
+        if (browser) { browser->stop(); browser.reset(); }
         if (appcontainer_sid) {
             for (const auto& path : acl_paths) revoke_appcontainer_access(path, appcontainer_sid);
         }
@@ -498,9 +699,13 @@ struct PlaywrightMcpProvider::Impl {
             std::filesystem::remove_all(plugin_temp, cleanup_error);
         }
         plugin_temp.clear();
+        if (!browser_run.empty() && safe_path(browser_run, true)) {
+            std::error_code cleanup_error;
+            std::filesystem::remove_all(browser_run, cleanup_error);
+        }
+        browser_run.clear();
         if (attributes) { DeleteProcThreadAttributeList(attributes); attributes = nullptr; }
         attributes_storage.clear();
-        if (internet_sid) { LocalFree(internet_sid); internet_sid = nullptr; }
         if (appcontainer_sid) { FreeSid(appcontainer_sid); appcontainer_sid = nullptr; }
         healthy = false;
     }

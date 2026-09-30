@@ -20,7 +20,7 @@ add_library(laso_core
 target_include_directories(laso_core PUBLIC include third_party/nlohmann_json/include)
 target_compile_definitions(laso_core PUBLIC UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_compile_options(laso_core PRIVATE /W4 /permissive- /EHsc /utf-8)
-target_link_libraries(laso_core PUBLIC User32 Gdi32 Shell32 Ole32 Windowscodecs Advapi32 Crypt32 Uiautomationcore Userenv)
+target_link_libraries(laso_core PUBLIC User32 Gdi32 Shell32 Ole32 Windowscodecs Advapi32 Crypt32 Uiautomationcore Userenv Winhttp Ws2_32 Iphlpapi)
 
 add_executable(laso-computer src/main.cpp)
 target_link_libraries(laso-computer PRIVATE laso_core)
