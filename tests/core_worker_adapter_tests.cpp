@@ -180,8 +180,8 @@ void approval_round_trip_and_denial() {
         laso::WorkerProtocol dispatcher(config, std::move(registry), laso::AuditLog{});
         laso::CoreWorkerAdapter adapter(dispatcher, 200, [] { return std::string("fixture-id"); });
         std::istringstream input(
-            "{\"protocol_version\":1,\"request_id\":\"approval-submit\",\"operation\":\"submit\",\"job_id\":\"approval-job\",\"external_job_id\":\"\",\"payload\":{\"worker_id\":\"worker-test\",\"durable_session_id\":\"session-test\",\"capability\":\"test.echo\",\"input\":{}}}\n" +
-            "{\"protocol_version\":1,\"message_type\":\"worker_response\",\"request_id\":\"interaction-fixture-id\",\"decision\":\"" + decision + "\",\"payload\":{},\"reason\":\"test decision\"}\n"
+            std::string("{\"protocol_version\":1,\"request_id\":\"approval-submit\",\"operation\":\"submit\",\"job_id\":\"approval-job\",\"external_job_id\":\"\",\"payload\":{\"worker_id\":\"worker-test\",\"durable_session_id\":\"session-test\",\"capability\":\"test.echo\",\"input\":{}}}\n") +
+            "{\"protocol_version\":1,\"message_type\":\"worker_response\",\"request_id\":\"interaction-fixture-id\",\"decision\":\"" + decision + "\",\"payload\":{},\"reason\":\"test decision\"}\n" +
             "{\"protocol_version\":1,\"request_id\":\"approval-shutdown\",\"operation\":\"shutdown\",\"job_id\":\"\",\"external_job_id\":\"\",\"payload\":{}}\n");
         std::ostringstream output, diagnostics;
         require(adapter.serve(input, output, diagnostics) == 0, "approval exchange should preserve worker transport");
