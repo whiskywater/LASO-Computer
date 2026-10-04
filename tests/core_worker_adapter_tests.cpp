@@ -374,7 +374,7 @@ void provider_interactions_stay_inside_submit_exchange() {
         if (require_approval)
             input_frame += "{\"protocol_version\":1,\"message_type\":\"worker_response\",\"request_id\":\"interaction-provider-interaction-1\",\"decision\":\"approved\",\"payload\":{},\"reason\":\"approved\"}\n";
         const auto provider_id = require_approval ? "provider-interaction-2" : "provider-interaction-1";
-        input_frame += "{\"protocol_version\":1,\"message_type\":\"worker_response\",\"request_id\":\"interaction-" +
+        input_frame += std::string("{\"protocol_version\":1,\"message_type\":\"worker_response\",\"request_id\":\"interaction-") +
                        provider_id + "\",\"decision\":\"" + decision + "\",\"payload\":" + response_payload.dump() +
                        ",\"reason\":\"test decision\"}\n";
         std::istringstream input(input_frame);
