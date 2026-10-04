@@ -31,6 +31,11 @@ bool CapabilityRegistry::available(const std::string& capability) const {
     return provider != providers_.end() && provider->second->health();
 }
 
+bool CapabilityRegistry::requires_synchronous_interactions(const std::string& capability) const {
+    const auto descriptor = descriptors_.find(capability);
+    return descriptor != descriptors_.end() && descriptor->second.requires_synchronous_interactions;
+}
+
 std::vector<CapabilityDescriptor> CapabilityRegistry::capabilities() const {
     std::vector<CapabilityDescriptor> out;
     out.reserve(descriptors_.size());

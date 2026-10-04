@@ -48,6 +48,41 @@ public:
     std::atomic_int calls{0};
 };
 
+class InteractiveProvider final : public laso::CapabilityProvider {
+public:
+    explicit InteractiveProvider(std::string interaction_type) : interaction_type_(std::move(interaction_type)) {}
+    [[nodiscard]] laso::PluginIdentity identity() const override {
+        return {"test.interactive", "1", "test-only interactive provider", false};
+    }
+    [[nodiscard]] std::vector<laso::CapabilityDescriptor> capabilities() const override {
+        laso::CapabilityDescriptor descriptor{"test.interactive", "test interaction", "low",
+                                             Json{{"type", "object"}}, true, {}};
+        descriptor.requires_synchronous_interactions = true;
+        return {descriptor};
+    }
+    [[nodiscard]] Json invoke(const laso::InvocationContext& context) override {
+        if (!context.request_interaction) throw std::runtime_error("interaction callback unavailable");
+        const auto request_payload = interaction_type_ == "permission"
+                                         ? Json{{"resource", "test.read"}}
+                                         : Json{{"questions", Json::array({"Continue?"})}};
+        const auto response = context.request_interaction(interaction_type_, request_payload);
+        const auto decision = response.value("decision", std::string{});
+        const auto payload = response.value("payload", Json::object());
+        if (interaction_type_ == "permission" && decision != "approved")
+            throw std::runtime_error("permission denied or unavailable");
+        if (interaction_type_ == "question" && decision != "answered")
+            throw std::runtime_error("question was not answered");
+        ++executions;
+        return {{"allowed", true}, {"decision", decision}, {"response", payload}};
+    }
+    [[nodiscard]] bool health() const override { return true; }
+    void shutdown() noexcept override {}
+    std::atomic_int executions{0};
+
+private:
+    std::string interaction_type_;
+};
+
 laso::core_worker_protocol::Request request(std::string id, std::string operation) {
     laso::core_worker_protocol::Request value;
     value.request_id = std::move(id);
@@ -319,6 +354,124 @@ void question_rejects_permission_decisions() {
     const auto result = adapter.exchange_interaction(interaction, input, output);
     require(result.decision == "cancelled", "Core-invalid question decision must fail closed");
 }
+
+void provider_interactions_stay_inside_submit_exchange() {
+    auto run = [](const std::string& type, const std::string& decision, const Json& response_payload,
+                  bool require_approval) {
+        laso::Config config;
+        config.capabilities["test.interactive"] = require_approval ? laso::Decision::require_approval
+                                                                     : laso::Decision::allow;
+        auto provider = std::make_shared<InteractiveProvider>(type);
+        laso::CapabilityRegistry registry;
+        registry.register_provider(provider);
+        laso::WorkerProtocol dispatcher(config, std::move(registry), laso::AuditLog{});
+        int sequence = 0;
+        laso::CoreWorkerAdapter adapter(dispatcher, 500, [&sequence] {
+            return "provider-interaction-" + std::to_string(++sequence);
+        });
+        std::string input_frame =
+            "{\"protocol_version\":1,\"request_id\":\"interactive-submit\",\"operation\":\"submit\",\"job_id\":\"interactive-job\",\"external_job_id\":\"\",\"payload\":{\"worker_id\":\"worker-test\",\"durable_session_id\":\"session-test\",\"capability\":\"test.interactive\",\"input\":{}}}\n";
+        if (require_approval)
+            input_frame += "{\"protocol_version\":1,\"message_type\":\"worker_response\",\"request_id\":\"interaction-provider-interaction-1\",\"decision\":\"approved\",\"payload\":{},\"reason\":\"approved\"}\n";
+        const auto provider_id = require_approval ? "provider-interaction-2" : "provider-interaction-1";
+        input_frame += "{\"protocol_version\":1,\"message_type\":\"worker_response\",\"request_id\":\"interaction-" +
+                       provider_id + "\",\"decision\":\"" + decision + "\",\"payload\":" + response_payload.dump() +
+                       ",\"reason\":\"test decision\"}\n";
+        std::istringstream input(input_frame);
+        std::ostringstream output, diagnostics;
+        require(adapter.serve(input, output, diagnostics) == 0,
+                "interactive provider exchange should preserve worker lifecycle");
+        std::istringstream frames(output.str());
+        std::vector<std::string> output_frames;
+        std::string line;
+        while (std::getline(frames, line)) output_frames.push_back(line);
+        const std::size_t expected = require_approval ? 3 : 2;
+        require(output_frames.size() == expected, "each interaction and operation should produce one frame");
+        std::size_t index = 0;
+        if (require_approval) {
+            require(Json::parse(output_frames[index++]).value("request_type", std::string{}) == "approval",
+                    "local require_approval must be resolved before provider execution");
+        }
+        const auto worker_request = Json::parse(output_frames[index++]);
+        require(worker_request.value("message_type", std::string{}) == "worker_request" &&
+                    worker_request.value("request_type", std::string{}) == type,
+                "provider interaction must use the matching Core request type");
+        const auto submit_response = Json::parse(output_frames[index++]);
+        require(submit_response.value("request_id", std::string{}) == "interactive-submit",
+                "submit response must follow all provider interactions");
+        auto result_request = request("interactive-result", "result");
+        result_request.external_job_id = submit_response.value("external_job_id", std::string{});
+        const auto final_result = adapter.handle(result_request);
+        require(provider->executions.load() ==
+                    ((type == "question" && decision == "answered") ||
+                             (type == "permission" && decision == "approved")
+                         ? 1
+                         : 0),
+                "provider must execute its test action only after a valid interaction response");
+        if (type == "question" && decision == "answered")
+            require(final_result.at("payload").at("response") == response_payload,
+                    "question answer payload must reach the provider result unchanged");
+        if (type == "permission" && decision == "denied")
+            require(final_result.value("state", std::string{}) == "Failed" &&
+                        final_result.value("error", std::string{}) == "permission denied or unavailable",
+                    "denied permission must yield a deterministic failed result");
+        if (decision == "cancelled")
+            require(final_result.value("state", std::string{}) == "Cancelled" &&
+                        final_result.value("error", std::string{}) == "cancelled",
+                    "cancelled interactions must preserve the cancelled job state");
+        if (decision == "expired")
+            require(final_result.value("state", std::string{}) == "TimedOut" &&
+                        final_result.value("error", std::string{}) == "timed out",
+                    "expired interactions must preserve the timeout job state");
+        std::istringstream shutdown_input(
+            "{\"protocol_version\":1,\"request_id\":\"interactive-shutdown\",\"operation\":\"shutdown\",\"job_id\":\"\",\"external_job_id\":\"\",\"payload\":{}}\n");
+        std::ostringstream shutdown_output, shutdown_diagnostics;
+        require(adapter.serve(shutdown_input, shutdown_output, shutdown_diagnostics) == 0 &&
+                    Json::parse(shutdown_output.str()).value("request_id", std::string{}) == "interactive-shutdown",
+                "worker should remain healthy for shutdown after interaction and result retrieval");
+    };
+
+    run("permission", "approved", Json::object(), true);
+    run("permission", "denied", Json::object(), false);
+    run("permission", "cancelled", Json::object(), false);
+    run("permission", "expired", Json::object(), false);
+    run("question", "answered", Json{{"answers", {{"continue", "yes"}}}}, false);
+    run("question", "cancelled", Json::object(), false);
+    run("question", "expired", Json::object(), false);
+}
+
+void endpoint_deny_precedes_provider_interactions() {
+    laso::Config config;
+    config.capabilities["test.interactive"] = laso::Decision::deny;
+    auto provider = std::make_shared<InteractiveProvider>("permission");
+    laso::CapabilityRegistry registry;
+    registry.register_provider(provider);
+    laso::WorkerProtocol dispatcher(config, std::move(registry), laso::AuditLog{});
+    laso::CoreWorkerAdapter adapter(dispatcher);
+    std::istringstream input(
+        "{\"protocol_version\":1,\"request_id\":\"deny-submit\",\"operation\":\"submit\",\"job_id\":\"deny-job\",\"external_job_id\":\"\",\"payload\":{\"worker_id\":\"worker-test\",\"capability\":\"test.interactive\",\"input\":{}}}\n"
+        "{\"protocol_version\":1,\"request_id\":\"deny-shutdown\",\"operation\":\"shutdown\",\"job_id\":\"\",\"external_job_id\":\"\",\"payload\":{}}\n");
+    std::ostringstream output, diagnostics;
+    require(adapter.serve(input, output, diagnostics) == 0 && provider->executions.load() == 0,
+            "endpoint deny must prevent provider interaction and execution");
+    require(output.str().find("worker_request") == std::string::npos,
+            "endpoint deny must not ask Core to override local policy");
+}
+
+void missing_provider_permission_response_fails_closed() {
+    laso::Config config;
+    config.capabilities["test.interactive"] = laso::Decision::allow;
+    auto provider = std::make_shared<InteractiveProvider>("permission");
+    laso::CapabilityRegistry registry;
+    registry.register_provider(provider);
+    laso::WorkerProtocol dispatcher(config, std::move(registry), laso::AuditLog{});
+    laso::CoreWorkerAdapter adapter(dispatcher, 10, [] { return std::string("missing-permission-response"); });
+    std::istringstream input(
+        "{\"protocol_version\":1,\"request_id\":\"missing-permission-submit\",\"operation\":\"submit\",\"job_id\":\"missing-permission-job\",\"external_job_id\":\"\",\"payload\":{\"worker_id\":\"worker-test\",\"capability\":\"test.interactive\",\"input\":{}}}\n");
+    std::ostringstream output, diagnostics;
+    require(adapter.serve(input, output, diagnostics) == 2 && provider->executions.load() == 0,
+            "unavailable permission interaction must not execute the dependent provider action");
+}
 } // namespace
 
 int main() {
@@ -332,6 +485,9 @@ int main() {
         cancel_completed_job_is_not_acknowledged();
         permission_and_question_interaction_frames();
         question_rejects_permission_decisions();
+        provider_interactions_stay_inside_submit_exchange();
+        endpoint_deny_precedes_provider_interactions();
+        missing_provider_permission_response_fails_closed();
         return 0;
     } catch (...) {
         return 1;

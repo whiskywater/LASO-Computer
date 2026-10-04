@@ -2,7 +2,7 @@
 
 LASO-Computer is a Windows endpoint worker for LASO. It runs as a supervised child process and provides a local security boundary for authorized computer-use operations. LASO owns orchestration, durable jobs and sessions, workflow policy, and approval records; this program owns local Windows interaction and rechecks endpoint policy before every action.
 
-The public implementation is native C++20 for Windows 10/11 x64. It has no Go, Python, .NET, Java, or Electron runtime dependency. It opens no inbound listener and does not implement remote enrollment or outbound endpoint transport. Its stdin/stdout worker supports the current process-worker v1 lifecycle operations: `hello`, `submit`, `status`, `result`, `cancel`, and `shutdown`, using bounded newline-delimited JSON. Submitted capability inputs still pass through endpoint-side policy. Correlated approval, permission, and question interactions are not implemented; `require_approval` therefore fails closed.
+The public implementation is native C++20 for Windows 10/11 x64. It has no Go, Python, .NET, Java, or Electron runtime dependency. It opens no inbound listener and does not implement remote enrollment or outbound endpoint transport. Its stdin/stdout worker supports the process-worker v1 lifecycle operations: `hello`, `submit`, `status`, `result`, `cancel`, and `shutdown`, using bounded newline-delimited JSON. Submitted capability inputs still pass through endpoint-side policy. `require_approval` uses a correlated Core approval exchange and fails closed unless it receives an exact approval. Providers can opt specific capabilities into bounded correlated permission and question exchanges through the invocation context; those submit exchanges remain open until provider execution completes.
 
 ## What works in this build
 
@@ -41,9 +41,9 @@ notepad "$env:LOCALAPPDATA\LASO-Computer\config.json"
 .\build\Debug\laso-computer.exe --status
 ```
 
-The configuration lives under the current user's Local AppData by default. New configurations deny every capability. Grant only the exact capabilities needed and use `require_approval` only when the supervising LASO protocol can provide a verified correlated approval exchange. This implementation currently fails closed for `require_approval`; it does not emit unsolicited worker request frames. Do not place credentials in configuration. `--check-config` reports actual decisions, non-denied capabilities, process allowlist count, and plugin paths without printing secrets.
+The configuration lives under the current user's Local AppData by default. New configurations deny every capability. Grant only the exact capabilities needed. `require_approval` remains fail-closed unless the worker receives a verified correlated approval from Core. Providers that opt into permission or question interactions must proceed only after the corresponding accepted response (`approved` or `answered`). Do not place credentials in configuration. `--check-config` reports actual decisions, non-denied capabilities, process allowlist count, and plugin paths without printing secrets.
 
-Without a status/configuration option, the executable reads and writes bounded JSON Lines worker-protocol messages on standard input/output. Diagnostics are written to standard error. The current implementation accepts optional durable/session/context fields without using them. Job `Failed`, `Cancelled`, and `TimedOut` states are represented as valid job results; protocol operation errors are separate. Confirm this behavior against LASO only after LASO publishes the matching protocol contract.
+Without a status/configuration option, the executable reads and writes bounded JSON Lines worker-protocol messages on standard input/output. Diagnostics are written to standard error. Job `Failed`, `Cancelled`, and `TimedOut` states are represented as valid job results; protocol operation errors are separate. Optional durable-session context is accepted where defined by the process-worker v1 contract. Live acceptance against a running Core is still outstanding.
 
 ## Security boundary
 
@@ -66,7 +66,7 @@ Third-party plugins do not receive unrestricted machine access. A provider must 
 ## Limitations
 
 - No remote enrollment, endpoint network transport, lease/reconnect protocol, or remote machine targeting. LASO must supervise the process locally.
-- No proven end-to-end integration against the current public LASO revision because it does not publish the worker-process contract expected by this worker. Approval request/response framing remains unavailable and therefore deny-by-default.
+- End-to-end acceptance against a running current Core and Windows worker has not yet been completed. Unit and Windows CI cover the worker protocol, provider dispatch, and correlated interaction framing. Browser containment and clean package provisioning remain unverified; see [Playwright provider](docs/playwright-provider.md).
 - Playwright MCP 0.0.83's own `fs.realpath` guard fails under Windows AppContainer because Node/libuv's DOS-volume `GetFinalPathNameByHandleW` step is denied. Node 22 and 24 reproduced it; minimal traverse/read-attributes ACEs did not fix it. No broad `C:\` permission was granted. MCP's documented unrestricted-file option avoids that canonicalization path. Separately, without a loopback exemption the AppContainer MCP's CDP request times out; the identical C++-owned Edge/dynamic endpoint and browser fixture pass in a diagnostic run outside AppContainer. No exemption was recreated. Same-user CDP hijacking remains possible; clean `npm ci`/postinstall and hosted browser CI are not validated. See [Playwright provider](docs/playwright-provider.md).
 - A medium-integrity `CreateRestrictedToken(DISABLE_MAX_PRIVILEGE)` diagnostic attached to Edge and passed the local fixture, but `IsTokenRestricted` was false and the provider could read and write a generated file outside its runtime. A `WinRestrictedCodeSid` variant did not initialize Node. Restricted-token mode was rejected; AppContainer remains production. See [the experiment and file/process access results](docs/restricted-token-experiment.md).
 - UI Automation coverage depends on each application's accessible control tree and provider support. Foreground focus remains subject to Windows policy.
@@ -81,4 +81,4 @@ LASO-Computer is licensed under Apache-2.0. The vendored JSON header and optiona
 
 ## Migration status
 
-The CMake build and public CI no longer depend on or build the Go implementation. The original Go source remains in the checkout temporarily because behavioral parity still depends on validating the worker contract and approval framing against public LASO, rechecking clean Playwright package provisioning and hosted CI, and rerunning interactive input/clipboard tests when Windows grants fixture focus. It is reference-only and is not part of the C++ runtime.
+The CMake build and public CI build and test the native C++ worker. The executable contains the C++ runtime and its declared native dependencies.

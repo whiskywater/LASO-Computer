@@ -260,7 +260,7 @@ PolicyInteractionResult CoreWorkerAdapter::exchange_interaction(const PolicyInte
     if (interaction.cancelled && interaction.cancelled()) return {"cancelled", Json::object(), "interaction cancelled"};
     const auto opaque_id = interaction_id_factory_ ? interaction_id_factory_() : random_id();
     const auto request_id = "interaction-" + opaque_id;
-    if (request_id.size() > 512 || request_id.empty()) { interaction_transport_failed_.store(true); return failed(); }
+    if (opaque_id.empty() || request_id.size() > 512) { interaction_transport_failed_.store(true); return failed(); }
     {
         std::scoped_lock lock(pending_mutex_);
         if (pending_.size() >= 64 || pending_.contains(request_id)) {

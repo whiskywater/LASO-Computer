@@ -21,7 +21,9 @@ class CoreWorkerAdapter {
 public:
     explicit CoreWorkerAdapter(WorkerProtocol& dispatcher, unsigned interaction_timeout_ms = 60000,
                                std::function<std::string()> interaction_id_factory = {})
-        : dispatcher_(dispatcher), interaction_timeout_ms_(interaction_timeout_ms),
+        : dispatcher_(dispatcher), interaction_timeout_ms_(interaction_timeout_ms == 0 ? 1U :
+                                                              interaction_timeout_ms > 300000U ? 300000U :
+                                                                                                  interaction_timeout_ms),
           interaction_id_factory_(std::move(interaction_id_factory)) {}
 
     [[nodiscard]] nlohmann::json handle(const core_worker_protocol::Request& request);

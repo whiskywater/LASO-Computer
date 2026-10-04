@@ -207,6 +207,7 @@ nlohmann::json WorkerProtocol::submit(const nlohmann::json& request) {
 
     const auto external_id = random_id();
     const auto interaction_handler = policy_interaction_handler_;
+    const bool synchronous_interactions = registry_.requires_synchronous_interactions(capability);
     const auto worker_id = request.value("worker_id", std::string{});
     const auto session_id = request.value("session_id", std::string{});
     auto job = std::make_shared<Job>();
@@ -216,6 +217,7 @@ nlohmann::json WorkerProtocol::submit(const nlohmann::json& request) {
     jobs_[external_id] = job;
     jobs_by_laso_id_[job_id] = external_id;
     job->worker = std::jthread([this, job, request_id, job_id, capability, worker_id, session_id,
+                                synchronous_interactions,
                                 interaction_handler, args = payload["arguments"]](std::stop_token stop) {
         std::string outcome = "success";
         std::string decision = to_string(config_.decision_for(capability));
@@ -245,6 +247,53 @@ nlohmann::json WorkerProtocol::submit(const nlohmann::json& request) {
             }
             InvocationContext invocation{request_id, job_id, job->id, capability, args, 30000,
                 [job, stop] { return stop.stop_requested() || job->cancelled.load(); }};
+            if (synchronous_interactions && interaction_handler) {
+                invocation.request_interaction = [interaction_handler, worker_id, job_id, external_id = job->id,
+                                                  session_id, capability, job, stop](
+                                                     const std::string& type, const nlohmann::json& payload) {
+                    const auto unavailable = [] {
+                        return nlohmann::json{{"decision", "cancelled"}, {"payload", nlohmann::json::object()},
+                                              {"reason", "interaction unavailable"}};
+                    };
+                    if ((type != "permission" && type != "question") || !payload.is_object() ||
+                        payload.dump().size() > 64 * 1024 || stop.stop_requested() || job->cancelled.load())
+                        return unavailable();
+                    PolicyInteraction interaction;
+                    interaction.worker_id = worker_id;
+                    interaction.worker_job_id = job_id;
+                    interaction.external_job_id = external_id;
+                    interaction.session_id = session_id;
+                    interaction.capability = capability;
+                    interaction.type = type;
+                    interaction.title = type == "permission" ? "Capability permission request" : "Capability question";
+                    interaction.summary = type == "permission" ? "A capability requires permission."
+                                                                  : "A capability requires an answer.";
+                    interaction.payload = payload;
+                    interaction.risk = type == "permission" ? "medium" : "low";
+                    interaction.category = type == "permission" ? "capability.permission" : "capability.question";
+                    interaction.cancelled = [job, stop] { return stop.stop_requested() || job->cancelled.load(); };
+                    PolicyInteractionResult response;
+                    try {
+                        response = interaction_handler(interaction);
+                    } catch (...) {
+                        return unavailable();
+                    }
+                    if (type == "permission") {
+                        if (response.decision == "approved")
+                            return nlohmann::json{{"decision", response.decision}, {"payload", response.payload},
+                                                  {"reason", response.reason}};
+                        if (response.decision == "cancelled") throw std::runtime_error("interaction cancelled");
+                        if (response.decision == "expired") throw std::runtime_error("interaction expired");
+                        throw std::runtime_error("permission denied or unavailable");
+                    }
+                    if (response.decision == "answered")
+                        return nlohmann::json{{"decision", response.decision}, {"payload", response.payload},
+                                              {"reason", response.reason}};
+                    if (response.decision == "cancelled") throw std::runtime_error("interaction cancelled");
+                    if (response.decision == "expired") throw std::runtime_error("interaction expired");
+                    throw std::runtime_error("question was not answered");
+                };
+            }
             auto result = registry_.invoke(invocation);
             std::scoped_lock job_lock(job->mutex);
             if (stop.stop_requested() || job->cancelled.load()) { job->state = "Cancelled"; outcome = "cancelled"; }
@@ -255,10 +304,16 @@ nlohmann::json WorkerProtocol::submit(const nlohmann::json& request) {
                 job->approval_resolved = true;
                 if (job->cancelled.load() || std::string(error.what()) == "cancelled") {
                     job->state = "Cancelled"; job->error = "cancelled"; outcome = "cancelled";
+                } else if (std::string(error.what()) == "interaction cancelled") {
+                    job->state = "Cancelled"; job->error = "cancelled"; outcome = "cancelled";
+                } else if (std::string(error.what()) == "interaction expired") {
+                    job->state = "TimedOut"; job->error = "timed out"; outcome = "timed_out";
                 } else if (std::string(error.what()) == "approval unavailable") {
                     job->state = "Failed"; job->error = "approval denied or unavailable"; outcome = "denied";
                 } else if (std::string(error.what()) == "capability denied") {
                     job->state = "Failed"; job->error = "capability denied"; outcome = "denied";
+                } else if (std::string(error.what()) == "permission denied or unavailable") {
+                    job->state = "Failed"; job->error = "permission denied or unavailable"; outcome = "denied";
                 } else if (std::string(error.what()) == "timed out") {
                     job->state = "TimedOut"; job->error = "timed out"; outcome = "timed_out";
                 } else if (std::string(error.what()) == "capability unavailable") {
@@ -270,10 +325,14 @@ nlohmann::json WorkerProtocol::submit(const nlohmann::json& request) {
             job->approval_changed.notify_all();
         }
         { std::scoped_lock job_lock(job->mutex); job->done = true; }
+        job->approval_changed.notify_all();
         audit_.event(request_id, capability, decision, outcome);
     });
     lock.unlock();
-    if (config_.decision_for(capability) == Decision::require_approval) {
+    if (synchronous_interactions) {
+        std::unique_lock job_lock(job->mutex);
+        job->approval_changed.wait(job_lock, [&] { return job->done; });
+    } else if (config_.decision_for(capability) == Decision::require_approval) {
         std::unique_lock job_lock(job->mutex);
         job->approval_changed.wait(job_lock, [&] { return job->approval_resolved || job->done; });
     }

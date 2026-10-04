@@ -26,7 +26,7 @@ The process-protocol implementation centrally limits incoming/outgoing frames to
 
 ## Provider contract
 
-Providers declare identity/version, named capability descriptions/schemas, invoke structured JSON with a timeout and cancellation token, report health, and shut down through lifecycle hooks. The registry binds provider capabilities to endpoint policy and records provider attribution. Registration is not authorization. Results are checked against configured bounds at the transport boundary. Native provider DLL loading is deliberately not provided.
+Providers declare identity/version, named capability descriptions/schemas, invoke structured JSON with a timeout and cancellation token, report health, and shut down through lifecycle hooks. A capability may set `CapabilityDescriptor::requires_synchronous_interactions` when it needs a Core permission decision or question answer. For that capability the Core submit exchange remains open until provider execution completes, so it cannot emit an interaction after acknowledging submission; ordinary capabilities keep the asynchronous submit path. The `InvocationContext::request_interaction` callback accepts only `permission` and `question`; interactive providers must request permission before the dependent action and proceed only on `approved`, while questions proceed only on `answered`. Local endpoint policy still runs first, and `deny` remains authoritative. Because the process protocol allows only one outstanding request, Core cannot send a regular job cancellation while an opted-in submit is waiting. A correlated interaction response of `cancelled` maps to a cancelled job; Core job cancellation before submit completes terminates the worker process. The registry binds provider capabilities to endpoint policy and records provider attribution. Registration is not authorization. Results are checked against configured bounds at the transport boundary. Native provider DLL loading is deliberately not provided.
 
 ## Capability selection
 
@@ -40,7 +40,7 @@ An optional LocalSystem development broker is a separate executable and service 
 
 ## Protocol status
 
-The current public LASO repository was inspected at `ef072429c96eb9b0964e56a561591a37ccb68fbd`. That revision did not expose a worker-process v1 protocol implementation/documentation. This repository's protocol is consequently pending upstream contract verification. Optional durable/session/context submit fields are accepted. Worker-originated approval framing is intentionally not guessed; endpoint approval-required actions are denied until LASO supports and documents correlated request/response framing.
+The worker uses the current process-worker v1 contract: bounded newline-delimited JSON, request correlation, submit-assigned external job IDs, and lifecycle operations for hello, status, submit, result, cancel, and shutdown. During an active submit, Core may issue correlated `worker_request` messages and replies with `worker_response`; approval decisions are accepted only when exactly `approved`. Providers may opt into permission and question exchanges through their capability descriptor and invocation context. Permission proceeds only on `approved`, questions only on `answered`, and cancellation/expiry remain terminal job outcomes. These exchanges are covered by worker-level tests; a live Core-to-Windows-worker acceptance run remains unverified.
 
 ## Not implemented
 

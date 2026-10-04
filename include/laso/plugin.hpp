@@ -24,6 +24,10 @@ struct CapabilityDescriptor {
     nlohmann::json argument_schema;
     bool available{false};
     std::string provider_id;
+    // This capability can request a Core interaction while it runs. The
+    // process adapter keeps submit open until execution completes so requests
+    // cannot arrive after Core has received its submit response.
+    bool requires_synchronous_interactions{false};
 };
 
 struct InvocationContext {
@@ -34,6 +38,10 @@ struct InvocationContext {
     nlohmann::json arguments;
     unsigned timeout_ms{30000};
     std::function<bool()> cancelled;
+    // Present only for a capability whose descriptor opts into synchronous
+    // interactions. Call before a dependent action and require "approved"
+    // for permission or "answered" for question before proceeding.
+    std::function<nlohmann::json(const std::string&, const nlohmann::json&)> request_interaction;
 };
 
 class CapabilityProvider {
@@ -50,6 +58,7 @@ class CapabilityRegistry {
 public:
     void register_provider(std::shared_ptr<CapabilityProvider> provider);
     [[nodiscard]] bool available(const std::string& capability) const;
+    [[nodiscard]] bool requires_synchronous_interactions(const std::string& capability) const;
     [[nodiscard]] std::vector<CapabilityDescriptor> capabilities() const;
     [[nodiscard]] nlohmann::json invoke(const InvocationContext& invocation) const;
     [[nodiscard]] std::vector<PluginIdentity> plugins() const;
