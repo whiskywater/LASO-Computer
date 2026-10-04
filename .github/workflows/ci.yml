@@ -26,3 +26,11 @@ jobs:
         run: cmake --build build --config ${{ matrix.configuration }} --parallel
       - name: Unit and protocol tests
         run: ctest --test-dir build -C ${{ matrix.configuration }} --output-on-failure
+      - name: Upload worker for acceptance
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: laso-computer-${{ matrix.configuration }}-${{ github.sha }}
+          path: build/${{ matrix.configuration }}/laso-computer.exe
+          if-no-files-found: error
+          retention-days: 1
