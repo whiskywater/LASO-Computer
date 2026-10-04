@@ -46,6 +46,48 @@ private:
     HANDLE h_{nullptr};
 };
 
+struct BrowserWindowSummary {
+    std::size_t visible_window_count{0};
+    bool browser_visible{false};
+    bool active_browser_visible{false};
+    HWND foreground{nullptr};
+};
+
+bool is_browser_window(HWND window) {
+    DWORD process_id = 0;
+    GetWindowThreadProcessId(window, &process_id);
+    if (process_id == 0) return false;
+    Handle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process_id));
+    if (!process) return false;
+    std::wstring image(32768, L'\0');
+    DWORD length = static_cast<DWORD>(image.size());
+    if (!QueryFullProcessImageNameW(process.get(), 0, image.data(), &length) || length == 0) return false;
+    image.resize(length);
+    auto executable = std::filesystem::path(image).filename().wstring();
+    std::transform(executable.begin(), executable.end(), executable.begin(),
+                   [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
+    static constexpr std::array<std::wstring_view, 6> browsers{
+        L"msedge.exe", L"chrome.exe", L"firefox.exe", L"brave.exe", L"opera.exe", L"vivaldi.exe"};
+    return std::find(browsers.begin(), browsers.end(), executable) != browsers.end();
+}
+
+BrowserWindowSummary browser_window_summary() {
+    BrowserWindowSummary summary;
+    summary.foreground = GetForegroundWindow();
+    if (!EnumWindows([](HWND window, LPARAM parameter) -> BOOL {
+            if (!IsWindowVisible(window)) return TRUE;
+            auto& state = *reinterpret_cast<BrowserWindowSummary*>(parameter);
+            ++state.visible_window_count;
+            if (is_browser_window(window)) {
+                state.browser_visible = true;
+                if (window == state.foreground) state.active_browser_visible = true;
+            }
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(&summary)))
+        throw std::runtime_error("browser status unavailable");
+    return summary;
+}
+
 class GdiObject {
 public:
     explicit GdiObject(HGDIOBJ object = nullptr) : object_(object) {}
@@ -553,6 +595,8 @@ std::vector<CapabilityDescriptor> WindowsPlatform::capabilities() const {
         {"clipboard.read", "Read plain-text clipboard data", "sensitive_read", schema(Json::object()), true, {}},
         {"clipboard.write", "Replace plain-text clipboard data", "sensitive_write",
             schema(Json{{"text", Json{{"type", "string"}, {"maxLength", 1048576}}}}, {"text"}), true, {}},
+        {"browser.status", "Report visible-window count and browser visibility without exposing titles", "sensitive_read",
+            schema(Json::object()), true, {}},
         {"window.list", "List visible top-level windows", "sensitive_read", schema(Json::object()), true, {}},
         {"window.focus", "Focus a visible top-level window by its local id", "interaction",
             schema(Json{{"window_id", Json{{"type", "string"}, {"maxLength", 128}}}}, {"window_id"}), true, {}},
@@ -590,9 +634,9 @@ void WindowsPlatform::shutdown() noexcept {}
 
 bool WindowsPlatform::available(const std::string& capability) const {
     if (capability == "shell.execute") return !config_.allowed_executables.empty();
-    static constexpr std::array<std::string_view, 12> native_capabilities{
+    static constexpr std::array<std::string_view, 13> native_capabilities{
         "screen.capture", "pointer.move", "pointer.click", "keyboard.type", "keyboard.key",
-        "clipboard.read", "clipboard.write", "window.list", "window.focus", "ui.focus", "ui.inspect", "ui.invoke"};
+        "clipboard.read", "clipboard.write", "browser.status", "window.list", "window.focus", "ui.focus", "ui.inspect", "ui.invoke"};
     return std::find(native_capabilities.begin(), native_capabilities.end(), capability) != native_capabilities.end();
 }
 
@@ -607,6 +651,12 @@ nlohmann::json WindowsPlatform::invoke(const std::string& capability, const nloh
     }
     if (capability == "ui.inspect") return inspect_ui(args, cancelled);
     if (capability == "ui.invoke") return invoke_ui(args, cancelled);
+    if (capability == "browser.status") {
+        const auto summary = browser_window_summary();
+        return {{"window_count", summary.visible_window_count},
+                {"browser_status", {{"browser_visible", summary.browser_visible},
+                                    {"active_browser_visible", summary.active_browser_visible}}}};
+    }
     if (capability == "pointer.move" || capability == "pointer.click") {
         if (args.value("coordinate_space", std::string{}) != "primary_display_pixels") throw std::runtime_error("invalid capability request");
         const int x = integer_arg(args, "x", 0, GetSystemMetrics(SM_CXSCREEN) - 1);

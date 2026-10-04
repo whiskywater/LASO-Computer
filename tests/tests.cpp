@@ -79,6 +79,8 @@ void config_tests() {
     require(config.decision_for("screen.capture") == laso::Decision::allow, "explicit allow must be effective");
     std::string error;
     require(config.validate(error), "valid config should pass");
+    config.capabilities["browser.status"] = laso::Decision::allow;
+    require(config.validate(error), "browser.status should be a recognized capability");
     config.capabilities["unknown"] = laso::Decision::allow;
     require(!config.validate(error), "unknown capability should fail config validation");
 }
@@ -92,6 +94,10 @@ void protocol_tests() {
     require(hello.value("ok", false), "hello should succeed");
     require(hello.value("protocol_version", 0) == 1, "protocol version should be v1");
     require(hello["payload"]["capabilities"].is_array(), "hello capabilities should be listed");
+    bool browser_status_advertised = false;
+    for (const auto& item : hello["payload"]["capabilities"])
+        if (item.value("name", std::string{}) == "browser.status") browser_status_advertised = true;
+    require(browser_status_advertised, "hello should advertise browser.status");
 
     auto submit = request("submit-1", "submit");
     submit["job_id"] = "job-1";

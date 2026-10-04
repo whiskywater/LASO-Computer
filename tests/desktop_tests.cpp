@@ -163,7 +163,7 @@ void run_tests() {
 
     laso::Config config;
     for (const auto* capability : {"screen.capture", "pointer.move", "pointer.click", "keyboard.type",
-            "clipboard.read", "clipboard.write", "window.list", "window.focus", "ui.focus", "ui.inspect", "ui.invoke"})
+            "clipboard.read", "clipboard.write", "browser.status", "window.list", "window.focus", "ui.focus", "ui.inspect", "ui.invoke"})
         config.capabilities[capability] = laso::Decision::allow;
     laso::CapabilityRegistry registry;
     registry.register_provider(std::make_shared<laso::WindowsPlatform>(config));
@@ -176,6 +176,16 @@ void run_tests() {
     bool found = false;
     for (const auto& item : list.at("windows")) if (item.value("window_id", "") == window_id) found = true;
     require(found, "window enumeration did not find the purpose-built fixture");
+
+    const auto browser_status = run_capability(worker, "browser.status", nlohmann::json::object());
+    require(browser_status.contains("window_count") && browser_status["window_count"].is_number(),
+            "browser status should include a visible window count");
+    require(browser_status.contains("browser_status") && browser_status["browser_status"].is_object() &&
+                browser_status["browser_status"].contains("browser_visible") &&
+                browser_status["browser_status"]["browser_visible"].is_boolean() &&
+                browser_status["browser_status"].contains("active_browser_visible") &&
+                browser_status["browser_status"]["active_browser_visible"].is_boolean(),
+            "browser status should expose visibility booleans without window titles");
 
     const auto inspected = run_capability(worker, "ui.inspect", {{"window_id", window_id}, {"max_nodes", 64}, {"max_depth", 4}});
     require(inspected.contains("elements") && inspected["elements"].is_array(), "UI Automation inspection failed");

@@ -72,7 +72,7 @@ Decision decision_from_string(const std::string& value) {
 const std::vector<std::string>& capability_names() {
     static const std::vector<std::string> values{
         "screen.capture", "pointer.move", "pointer.click", "keyboard.type", "keyboard.key",
-        "clipboard.read", "clipboard.write", "window.list", "window.focus", "ui.focus",
+        "clipboard.read", "clipboard.write", "window.list", "window.focus", "ui.focus", "browser.status",
         "ui.inspect", "ui.invoke", "browser.navigate", "browser.snapshot", "browser.query",
         "browser.click", "browser.fill", "browser.select", "browser.tabs", "browser.back",
         "browser.screenshot", "shell.execute"};

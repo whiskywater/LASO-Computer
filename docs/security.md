@@ -2,9 +2,9 @@
 
 ## Authorization and capabilities
 
-Each invocation goes through the endpoint policy before a provider is called. The default decision is `deny`; LASO authorization cannot enable an action that endpoint policy denies. Capabilities are named individually, including `screen.capture`, `pointer.move`, `pointer.click`, `keyboard.type`, `keyboard.key`, `clipboard.read`, `clipboard.write`, `window.list`, `window.focus`, `ui.inspect`, `ui.invoke`, `browser.*`, and `shell.execute`.
+Each invocation goes through the endpoint policy before a provider is called. The default decision is `deny`; LASO authorization cannot enable an action that endpoint policy denies. Capabilities are named individually, including `screen.capture`, `pointer.move`, `pointer.click`, `keyboard.type`, `keyboard.key`, `clipboard.read`, `clipboard.write`, `window.list`, `window.focus`, `ui.inspect`, `ui.invoke`, `browser.status`, the Playwright `browser.*` actions, and `shell.execute`. `browser.status` reports only the visible top-level window count and whether a supported browser window is visible or foreground; it does not return window titles or process paths.
 
-The implemented policy decisions are `allow`, `deny`, and `require_approval`. `require_approval` currently fails closed because the public LASO revision inspected does not document a correlated worker-request exchange. LASO-Computer does not emit arbitrary unsolicited frames between protocol requests. No approval should be described as integrated until tested against an upstream contract.
+The implemented policy decisions are `allow`, `deny`, and `require_approval`. Core's current worker-process v1 contract documents correlated `approval`, `permission`, and `question` requests with worker responses. LASO-Computer does not yet implement that process-worker interaction channel, so endpoint `require_approval` remains fail-closed until adapter integration and end-to-end tests pass. LASO-Computer does not emit unsolicited interaction frames between protocol requests.
 
 ## Plugins and adapters
 
