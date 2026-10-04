@@ -4,6 +4,9 @@
 #include "laso/core_worker_adapter.hpp"
 #include "laso/audit.hpp"
 #include "laso/playwright.hpp"
+#ifdef LASO_ACCEPTANCE_TEST_WORKER
+#include "laso/acceptance_test_provider.hpp"
+#endif
 
 #include <Windows.h>
 
@@ -81,6 +84,9 @@ int wmain(int argc, wchar_t** argv) {
         }
         laso::CapabilityRegistry registry;
         registry.register_provider(platform);
+#ifdef LASO_ACCEPTANCE_TEST_WORKER
+        registry.register_provider(std::make_shared<laso::AcceptanceTestProvider>());
+#endif
         if (config.playwright.enabled) {
             auto playwright = std::make_shared<laso::PlaywrightMcpProvider>(config.playwright);
             if (!playwright->health()) std::cerr << "playwright plugin unavailable: " << playwright->status_detail() << '\n';

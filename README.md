@@ -82,3 +82,7 @@ LASO-Computer is licensed under Apache-2.0. The vendored JSON header and optiona
 ## Migration status
 
 The CMake build and public CI build and test the native C++ worker. The executable contains the C++ runtime and its declared native dependencies.
+
+## Acceptance-only worker
+
+Windows CI also builds `laso-computer-acceptance.exe` when `LASO_BUILD_ACCEPTANCE_WORKER=ON`. This separate executable adds inert capabilities for exercising correlated permission, question, and cooperative cancellation flows against Core. The option defaults off; the acceptance executable is not part of the normal worker or packaging and must not be deployed.

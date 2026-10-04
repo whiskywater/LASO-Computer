@@ -21,7 +21,7 @@ jobs:
         with:
           arch: x64
       - name: Configure
-        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DBUILD_TESTING=ON
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DBUILD_TESTING=ON -DLASO_BUILD_ACCEPTANCE_WORKER=ON
       - name: Build
         run: cmake --build build --config ${{ matrix.configuration }} --parallel
       - name: Unit and protocol tests
@@ -31,6 +31,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: laso-computer-${{ matrix.configuration }}-${{ github.sha }}
-          path: build/${{ matrix.configuration }}/laso-computer.exe
+          path:
+            build/${{ matrix.configuration }}/laso-computer.exe
+            build/${{ matrix.configuration }}/laso-computer-acceptance.exe
           if-no-files-found: error
           retention-days: 1

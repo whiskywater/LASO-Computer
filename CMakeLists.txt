@@ -65,3 +65,13 @@ if(BUILD_TESTING)
   target_link_libraries(laso-restricted-token-probe PRIVATE Advapi32)
   target_compile_options(laso-restricted-token-probe PRIVATE /W4 /permissive- /EHsc /utf-8)
 endif()
+
+# This opt-in executable is only for end-to-end protocol acceptance. It is
+# separate from the shipping worker and is disabled unless explicitly enabled.
+option(LASO_BUILD_ACCEPTANCE_WORKER "Build the isolated acceptance-only worker" OFF)
+if(LASO_BUILD_ACCEPTANCE_WORKER)
+  add_executable(laso-computer-acceptance src/main.cpp src/acceptance_test_provider.cpp)
+  target_link_libraries(laso-computer-acceptance PRIVATE laso_core)
+  target_compile_definitions(laso-computer-acceptance PRIVATE LASO_ACCEPTANCE_TEST_WORKER)
+  target_compile_options(laso-computer-acceptance PRIVATE /W4 /permissive- /EHsc /utf-8)
+endif()
