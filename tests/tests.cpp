@@ -1,6 +1,7 @@
 #include "laso/config.hpp"
 #include "laso/protocol.hpp"
 #include "laso/platform.hpp"
+#include "laso/core_worker_protocol.hpp"
 
 #include <chrono>
 #include <Windows.h>
@@ -343,6 +344,56 @@ void frame_tests() {
     require(!safe_response.value("ok", true) && safe_response.value("error", std::string{}) == "response exceeds frame size limit",
             "oversized result must become a controlled protocol error");
 }
+
+void core_worker_protocol_tests() {
+    namespace protocol = laso::core_worker_protocol;
+    const std::string valid =
+        "{\"protocol_version\":1,\"request_id\":\"req-7\",\"operation\":\"submit\","
+        "\"job_id\":\"job-7\",\"external_job_id\":\"\",\"payload\":{\"input\":{}}}\n";
+    const auto request = protocol::parse_request_frame(valid);
+    require(request.request_id == "req-7" && request.operation == "submit" && request.job_id == "job-7",
+            "Core worker request fields should parse");
+    protocol::Response result;
+    result.request_id = request.request_id;
+    result.state = "Completed";
+    result.external_job_id = "external-7";
+    result.payload = {{"answer", 42}};
+    const auto encoded = protocol::serialize_response_frame(result);
+    require(!encoded.empty() && encoded.back() == '\n', "Core worker response should be newline framed");
+    const auto response = nlohmann::json::parse(encoded);
+    require(response.at("protocol_version") == 1 && response.at("request_id") == request.request_id &&
+                response.at("ok") == true && response.at("state") == "Completed" &&
+                response.at("external_job_id") == "external-7" && response.at("payload").at("answer") == 42,
+            "Core worker response should preserve correlation and result fields");
+
+    auto rejects = [](const std::string& frame) {
+        try { (void)protocol::parse_request_frame(frame); } catch (const std::exception&) { return true; }
+        return false;
+    };
+    require(rejects("{not-json}\n"), "malformed JSON frame should be rejected");
+    require(rejects(valid.substr(0, valid.size() - 1)), "truncated frame should be rejected");
+    require(rejects(std::string(protocol::max_frame_bytes + 1, 'x') + "\n"), "oversized frame should be rejected");
+    require(rejects("{\"protocol_version\":1,\"operation\":\"submit\",\"job_id\":\"j\",\"external_job_id\":\"\",\"payload\":{}}\n"),
+            "request without correlation id should be rejected");
+    require(rejects("{\"protocol_version\":1,\"request_id\":\"r\",\"operation\":\"exec\",\"job_id\":\"j\",\"external_job_id\":\"\",\"payload\":{}}\n"),
+            "unknown worker operation should be rejected");
+    require(rejects("{\"protocol_version\":1,\"request_id\":\"r\",\"request_id\":\"x\",\"operation\":\"submit\",\"job_id\":\"j\",\"external_job_id\":\"\",\"payload\":{}}\n"),
+            "duplicate JSON members should be rejected");
+    require(rejects("{\"protocol_version\":1,\"request_id\":\"r\",\"operation\":\"submit\",\"job_id\":\"j\",\"external_job_id\":\"\",\"payload\":{\"nested\":{\"a\":1,\"a\":2}}}\n"),
+            "nested duplicate JSON members should be rejected");
+    const auto cancellation = protocol::parse_request_frame(
+        "{\"protocol_version\":1,\"request_id\":\"req-cancel\",\"operation\":\"cancel\",\"job_id\":\"job-7\",\"external_job_id\":\"external-7\",\"payload\":{}}\n");
+    require(cancellation.operation == "cancel" && cancellation.external_job_id == "external-7",
+            "Core cancellation should target the correlated external job");
+    require(rejects("{\"protocol_version\":1,\"request_id\":\"r\",\"operation\":\"cancel\",\"job_id\":\"j\",\"external_job_id\":\"\",\"payload\":{}}\n"),
+            "cancel request without external job id should be rejected");
+    protocol::Response failed;
+    failed.request_id = "req-fail";
+    failed.ok = false;
+    failed.error = "protocol failure";
+    require(nlohmann::json::parse(protocol::serialize_response_frame(failed)).at("error") == "protocol failure",
+            "Core worker error response should preserve its error text");
+}
 }
 
 int main() {
@@ -354,6 +405,7 @@ int main() {
         process_tests();
         lifetime_bound_tests();
         frame_tests();
+        core_worker_protocol_tests();
         std::cout << "All LASO-Computer tests passed\n";
         return 0;
     } catch (const std::exception& error) {
