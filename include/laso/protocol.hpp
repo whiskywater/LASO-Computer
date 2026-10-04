@@ -5,8 +5,10 @@
 #include "laso/platform.hpp"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <istream>
 #include <mutex>
 #include <nlohmann/json.hpp>
@@ -19,6 +21,16 @@
 
 namespace laso {
 
+struct PolicyInteraction {
+    std::string worker_id;
+    std::string worker_job_id;
+    std::string external_job_id;
+    std::string session_id;
+    std::string capability;
+    std::function<bool()> cancelled;
+};
+using PolicyInteractionHandler = std::function<bool(const PolicyInteraction&)>;
+
 inline constexpr std::size_t max_frame_bytes = 1U << 20;
 [[nodiscard]] std::string encode_response_frame(const nlohmann::json& response);
 
@@ -29,6 +41,7 @@ public:
     ~WorkerProtocol();
     int serve(std::istream& input, std::ostream& output, std::ostream& diagnostics);
     [[nodiscard]] nlohmann::json handle(const nlohmann::json& request);
+    void set_policy_interaction_handler(PolicyInteractionHandler handler);
 
 private:
     struct Job {
@@ -40,6 +53,8 @@ private:
         std::string error;
         std::atomic_bool cancelled{false};
         std::mutex mutex;
+        std::condition_variable approval_changed;
+        bool approval_resolved{false};
         bool done{false};
         std::jthread worker;
     };
@@ -64,6 +79,7 @@ private:
     std::unordered_set<std::string> seen_job_ids_;
     std::uint64_t next_job_sequence_{1};
     std::atomic_bool shutting_down_{false};
+    PolicyInteractionHandler policy_interaction_handler_;
 };
 
 } // namespace laso

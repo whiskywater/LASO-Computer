@@ -2,6 +2,14 @@
 
 #include <string>
 #include <vector>
+#include <chrono>
+#include <ctime>
+#include <iomanip>
+#include <iostream>
+#include <sstream>
+#include <set>
+#include <thread>
+#include <Windows.h>
 
 namespace laso {
 namespace {
@@ -19,6 +27,62 @@ Json adapter_error(const std::string& request_id, const std::string& message) {
 
 bool bounded_error(const Json& value) {
     return value.is_string() && value.get_ref<const std::string&>().size() <= max_error_bytes;
+}
+
+std::string utc_timestamp(std::chrono::system_clock::time_point point) {
+    const auto time = std::chrono::system_clock::to_time_t(point);
+    std::tm value{};
+    gmtime_s(&value, &time);
+    std::ostringstream out;
+    out << std::put_time(&value, "%Y-%m-%dT%H:%M:%SZ");
+    return out.str();
+}
+
+bool read_timed_line(std::istream& input, std::string& line, std::size_t limit,
+                     std::chrono::steady_clock::time_point deadline,
+                     const std::function<bool()>& cancelled) {
+    for (;;) {
+        if (cancelled && cancelled()) return false;
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        if (input.rdbuf()->in_avail() <= 0) {
+            if (input.eof()) return false;
+            if (&input == &std::cin) {
+                DWORD available = 0;
+                const auto handle = GetStdHandle(STD_INPUT_HANDLE);
+                if (handle == INVALID_HANDLE_VALUE || handle == nullptr ||
+                    !PeekNamedPipe(handle, nullptr, 0, nullptr, &available, nullptr)) return false;
+                if (available == 0) { Sleep(5); continue; }
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
+            }
+        }
+        char ch = 0;
+        if (!input.get(ch)) return false;
+        if (ch == '\n') return true;
+        if (line.size() >= limit) return false;
+        line.push_back(ch);
+    }
+}
+
+Json parse_unique_json(const std::string& text) {
+    bool duplicate = false;
+    std::vector<std::set<std::string>> keys;
+    const auto callback = [&duplicate, &keys](int depth, Json::parse_event_t event, Json& value) {
+        if (depth < 0) return true;
+        const auto index = static_cast<std::size_t>(depth);
+        if (event == Json::parse_event_t::object_start) {
+            if (keys.size() <= index) keys.resize(index + 1);
+            keys[index].clear();
+        } else if (event == Json::parse_event_t::key) {
+            if (keys.size() <= index) keys.resize(index + 1);
+            if (!keys[index].insert(value.get<std::string>()).second) duplicate = true;
+        }
+        return true;
+    };
+    auto value = Json::parse(text, callback, true, false);
+    if (duplicate || !value.is_object()) throw std::invalid_argument("invalid interaction response");
+    return value;
 }
 
 } // namespace
@@ -40,6 +104,20 @@ Json CoreWorkerAdapter::handle(const core_worker_protocol::Request& request) {
             return adapter_error(request.request_id, "invalid capability request");
         legacy["payload"] = {{"capability", request.payload.at("capability")},
                              {"arguments", request.payload.at("input")}};
+        std::string worker_id = "laso-computer";
+        if (request.payload.contains("worker_id")) {
+            if (!request.payload.at("worker_id").is_string() || request.payload.at("worker_id").get_ref<const std::string&>().size() > 512)
+                return adapter_error(request.request_id, "invalid worker identity");
+            worker_id = request.payload.at("worker_id").get<std::string>();
+            if (worker_id.empty()) worker_id = "laso-computer";
+        }
+        legacy["worker_id"] = worker_id;
+        if (request.payload.contains("durable_session_id")) {
+            if (!request.payload.at("durable_session_id").is_string() ||
+                request.payload.at("durable_session_id").get_ref<const std::string&>().size() > 512)
+                return adapter_error(request.request_id, "invalid session identity");
+            legacy["session_id"] = request.payload.at("durable_session_id");
+        }
     } else {
         legacy["payload"] = Json::object();
     }
@@ -99,6 +177,23 @@ Json CoreWorkerAdapter::handle(const core_worker_protocol::Request& request) {
 }
 
 int CoreWorkerAdapter::serve(std::istream& input, std::ostream& output, std::ostream& diagnostics) {
+    interaction_input_ = &input;
+    interaction_output_ = &output;
+    interaction_transport_failed_.store(false);
+    stopping_.store(false);
+    dispatcher_.set_policy_interaction_handler([this](const PolicyInteraction& interaction) {
+        return request_approval(interaction);
+    });
+    struct Cleanup {
+        CoreWorkerAdapter& adapter;
+        ~Cleanup() {
+            adapter.stopping_.store(true);
+            adapter.dispatcher_.set_policy_interaction_handler({});
+            adapter.clear_interactions();
+            adapter.interaction_input_ = nullptr;
+            adapter.interaction_output_ = nullptr;
+        }
+    } cleanup{*this};
     for (;;) {
         std::string frame;
         bool too_large = false;
@@ -128,6 +223,10 @@ int CoreWorkerAdapter::serve(std::istream& input, std::ostream& output, std::ost
         }
         const bool shutdown = request.operation == "shutdown";
         const auto response = handle(request);
+        if (interaction_transport_failed_.load()) {
+            diagnostics << "worker interaction channel failed\n";
+            return 2;
+        }
         auto encoded = response.dump(-1, ' ', false, Json::error_handler_t::strict);
         if (encoded.size() > core_worker_protocol::max_frame_bytes) {
             diagnostics << "worker response exceeds protocol limit\n";
@@ -139,6 +238,96 @@ int CoreWorkerAdapter::serve(std::istream& input, std::ostream& output, std::ost
         if (!output.good()) return 2;
         if (shutdown) return 0;
     }
+}
+
+bool CoreWorkerAdapter::request_approval(const PolicyInteraction& interaction) {
+    return exchange_interaction(interaction, "approval");
+}
+
+bool CoreWorkerAdapter::exchange_interaction(const PolicyInteraction& interaction, const std::string& type) {
+    std::unique_lock io_lock(interaction_io_mutex_);
+    if (stopping_.load() || !interaction_input_ || !interaction_output_ || interaction.worker_id.empty() ||
+        interaction.worker_id.size() > 512 || interaction.worker_job_id.empty() ||
+        interaction.worker_job_id.size() > 512 || interaction.external_job_id.empty() ||
+        interaction.external_job_id.size() > 512 || interaction.session_id.size() > 512 ||
+        type != "approval") {
+        interaction_transport_failed_.store(true);
+        return false;
+    }
+    if (interaction.cancelled && interaction.cancelled()) return false;
+    const auto opaque_id = interaction_id_factory_ ? interaction_id_factory_() : random_id();
+    const auto request_id = "interaction-" + opaque_id;
+    if (request_id.size() > 512) { interaction_transport_failed_.store(true); return false; }
+    {
+        std::scoped_lock lock(pending_mutex_);
+        if (pending_.size() >= 64 || pending_.contains(request_id)) {
+            interaction_transport_failed_.store(true);
+            return false;
+        }
+        pending_.emplace(request_id, type);
+    }
+    struct PendingCleanup {
+        CoreWorkerAdapter& adapter;
+        std::string id;
+        ~PendingCleanup() { std::scoped_lock lock(adapter.pending_mutex_); adapter.pending_.erase(id); }
+    } pending_cleanup{*this, request_id};
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(interaction_timeout_ms_);
+    const auto wall_deadline = std::chrono::system_clock::now() + std::chrono::milliseconds(interaction_timeout_ms_);
+    const auto now = std::chrono::system_clock::now();
+    Json message{{"protocol_version", core_worker_protocol::version}, {"message_type", "worker_request"},
+                 {"request_id", request_id}, {"worker_job_id", interaction.worker_job_id},
+                 {"worker_id", interaction.worker_id}, {"external_job_id", interaction.external_job_id},
+                 {"session_id", interaction.session_id}, {"request_type", type},
+                 {"title", "Capability approval"},
+                 {"summary", "An endpoint capability requires a policy decision."},
+                 {"payload", {{"capability", interaction.capability}}},
+                 {"created_at", utc_timestamp(now)}, {"deadline", utc_timestamp(wall_deadline)},
+                 {"risk", "high"}, {"category", "capability"}};
+    auto encoded = message.dump(-1, ' ', false, Json::error_handler_t::strict);
+    if (encoded.size() > core_worker_protocol::max_frame_bytes) {
+        interaction_transport_failed_.store(true);
+        return false;
+    }
+    interaction_output_->write(encoded.data(), static_cast<std::streamsize>(encoded.size()));
+    interaction_output_->put('\n');
+    interaction_output_->flush();
+    if (!interaction_output_->good()) { interaction_transport_failed_.store(true); return false; }
+
+    std::string line;
+    if (!read_timed_line(*interaction_input_, line, core_worker_protocol::max_frame_bytes, deadline,
+                         interaction.cancelled)) {
+        if (!(interaction.cancelled && interaction.cancelled())) interaction_transport_failed_.store(true);
+        return false;
+    }
+    Json answer;
+    try { answer = parse_unique_json(line); } catch (...) { interaction_transport_failed_.store(true); return false; }
+    static const std::set<std::string> allowed_fields{
+        "protocol_version", "message_type", "request_id", "decision", "payload", "reason"};
+    for (auto it = answer.begin(); it != answer.end(); ++it)
+        if (!allowed_fields.contains(it.key())) { interaction_transport_failed_.store(true); return false; }
+    if (!answer.contains("protocol_version") || !answer["protocol_version"].is_number_integer() ||
+        answer["protocol_version"] != core_worker_protocol::version ||
+        !answer.contains("message_type") || !answer["message_type"].is_string() ||
+        answer["message_type"] != "worker_response" ||
+        !answer.contains("request_id") || !answer["request_id"].is_string() ||
+        answer["request_id"] != request_id ||
+        !answer.contains("decision") || !answer["decision"].is_string() ||
+        !answer.contains("payload") || !answer["payload"].is_object() || answer["payload"].dump().size() > 64 * 1024 ||
+        !answer.contains("reason") || !answer["reason"].is_string() || answer["reason"].get_ref<const std::string&>().size() > 4096) {
+        interaction_transport_failed_.store(true);
+        return false;
+    }
+    const auto decision = answer["decision"].get<std::string>();
+    const bool compatible = decision == "approved" || decision == "denied" ||
+                            decision == "cancelled" || decision == "expired";
+    if (!compatible) { interaction_transport_failed_.store(true); return false; }
+    return type == "approval" && decision == "approved";
+}
+
+void CoreWorkerAdapter::clear_interactions() noexcept {
+    std::scoped_lock lock(pending_mutex_);
+    pending_.clear();
 }
 
 } // namespace laso

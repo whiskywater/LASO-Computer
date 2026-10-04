@@ -87,7 +87,7 @@ int wmain(int argc, wchar_t** argv) {
             registry.register_provider(std::move(playwright));
         }
         laso::WorkerProtocol worker(config, std::move(registry), laso::AuditLog{});
-        laso::CoreWorkerAdapter adapter(worker);
+        laso::CoreWorkerAdapter adapter(worker, config.approval_timeout_ms);
         return adapter.serve(std::cin, std::cout, std::cerr);
     } catch (const std::exception& error) {
         std::cerr << "laso-computer: " << error.what() << '\n';

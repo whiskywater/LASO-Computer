@@ -4,6 +4,8 @@
 #include <chrono>
 #include <regex>
 #include <stdexcept>
+#include <condition_variable>
+#include <utility>
 
 namespace laso {
 namespace {
@@ -40,6 +42,11 @@ WorkerProtocol::WorkerProtocol(Config config, WindowsPlatform platform, AuditLog
 
 WorkerProtocol::WorkerProtocol(Config config, CapabilityRegistry registry, AuditLog audit)
     : config_(std::move(config)), registry_(std::move(registry)), audit_(std::move(audit)) {}
+
+void WorkerProtocol::set_policy_interaction_handler(PolicyInteractionHandler handler) {
+    std::scoped_lock lock(mutex_);
+    policy_interaction_handler_ = std::move(handler);
+}
 
 WorkerProtocol::~WorkerProtocol() {
     std::vector<std::shared_ptr<Job>> jobs;
@@ -116,9 +123,21 @@ nlohmann::json WorkerProtocol::handle(const nlohmann::json& request) {
             if (it == jobs_.end()) return fail(request_id, "job not found");
             job = it->second;
         }
-        job->cancelled.store(true);
-        job->worker.request_stop();
-        return success(request_id, "Running", {{"cancellation_requested", true}});
+        bool acknowledged = false;
+        std::string state;
+        {
+            std::scoped_lock job_lock(job->mutex);
+            state = job->state;
+            if (!job->done && job->state == "Running") {
+                job->cancelled.store(true);
+                job->worker.request_stop();
+                acknowledged = true;
+            }
+        }
+        auto response = success(request_id, acknowledged ? "Running" : state,
+                                {{"cancellation_requested", acknowledged}, {"acknowledged", acknowledged}});
+        response["acknowledged"] = acknowledged;
+        return response;
     }
     if (operation == "shutdown") {
         std::vector<std::shared_ptr<Job>> jobs;
@@ -147,7 +166,7 @@ nlohmann::json WorkerProtocol::submit(const nlohmann::json& request) {
     const auto job_id = request["job_id"].get<std::string>();
     if (payload["arguments"].dump().size() > max_frame_bytes) return fail(request_id, "request exceeds size limit");
 
-    std::scoped_lock lock(mutex_);
+    std::unique_lock lock(mutex_);
     if (shutting_down_) return fail(request_id, "worker is shutting down");
     if (jobs_by_laso_id_.contains(job_id) || seen_job_ids_.contains(job_id))
         return fail(request_id, "job id already submitted");
@@ -187,21 +206,37 @@ nlohmann::json WorkerProtocol::submit(const nlohmann::json& request) {
     seen_job_order_.push_back(job_id);
 
     const auto external_id = random_id();
+    const auto interaction_handler = policy_interaction_handler_;
+    const auto worker_id = request.value("worker_id", std::string{});
+    const auto session_id = request.value("session_id", std::string{});
     auto job = std::make_shared<Job>();
     job->id = external_id;
     job->laso_id = job_id;
     job->sequence = next_job_sequence_++;
     jobs_[external_id] = job;
     jobs_by_laso_id_[job_id] = external_id;
-    job->worker = std::jthread([this, job, request_id, job_id, capability, args = payload["arguments"]](std::stop_token stop) {
+    job->worker = std::jthread([this, job, request_id, job_id, capability, worker_id, session_id,
+                                interaction_handler, args = payload["arguments"]](std::stop_token stop) {
         std::string outcome = "success";
         std::string decision = to_string(config_.decision_for(capability));
         try {
             const auto policy = config_.decision_for(capability);
             if (!registry_.available(capability)) throw std::runtime_error("capability unavailable");
             if (policy == Decision::deny) throw std::runtime_error("capability denied");
-            if (policy == Decision::require_approval) throw std::runtime_error("approval unavailable");
             if (stop.stop_requested() || job->cancelled.load()) throw std::runtime_error("cancelled");
+            if (policy == Decision::require_approval) {
+                if (!interaction_handler || worker_id.empty()) throw std::runtime_error("approval unavailable");
+                PolicyInteraction interaction{worker_id, job_id, job->id, session_id, capability,
+                    [job, stop] { return stop.stop_requested() || job->cancelled.load(); }};
+                bool approved = false;
+                try { approved = interaction_handler(interaction); } catch (...) { approved = false; }
+                {
+                    std::scoped_lock job_lock(job->mutex);
+                    job->approval_resolved = true;
+                }
+                job->approval_changed.notify_all();
+                if (!approved) throw std::runtime_error("approval unavailable");
+            }
             InvocationContext invocation{request_id, job_id, job->id, capability, args, 30000,
                 [job, stop] { return stop.stop_requested() || job->cancelled.load(); }};
             auto result = registry_.invoke(invocation);
@@ -209,24 +244,33 @@ nlohmann::json WorkerProtocol::submit(const nlohmann::json& request) {
             if (stop.stop_requested() || job->cancelled.load()) { job->state = "Cancelled"; outcome = "cancelled"; }
             else { job->state = "Completed"; job->payload = std::move(result); }
         } catch (const std::exception& error) {
-            std::scoped_lock job_lock(job->mutex);
-            if (job->cancelled.load() || std::string(error.what()) == "cancelled") {
-                job->state = "Cancelled"; job->error = "cancelled"; outcome = "cancelled";
-            } else if (std::string(error.what()) == "approval unavailable") {
-                job->state = "Failed"; job->error = "approval denied or unavailable"; outcome = "denied";
-            } else if (std::string(error.what()) == "capability denied") {
-                job->state = "Failed"; job->error = "capability denied"; outcome = "denied";
-            } else if (std::string(error.what()) == "timed out") {
-                job->state = "TimedOut"; job->error = "timed out"; outcome = "timed_out";
-            } else if (std::string(error.what()) == "capability unavailable") {
-                job->state = "Failed"; job->error = "capability unavailable"; outcome = "failed";
-            } else {
-                job->state = "Failed"; job->error = "capability failed"; outcome = "failed";
+            {
+                std::scoped_lock job_lock(job->mutex);
+                job->approval_resolved = true;
+                if (job->cancelled.load() || std::string(error.what()) == "cancelled") {
+                    job->state = "Cancelled"; job->error = "cancelled"; outcome = "cancelled";
+                } else if (std::string(error.what()) == "approval unavailable") {
+                    job->state = "Failed"; job->error = "approval denied or unavailable"; outcome = "denied";
+                } else if (std::string(error.what()) == "capability denied") {
+                    job->state = "Failed"; job->error = "capability denied"; outcome = "denied";
+                } else if (std::string(error.what()) == "timed out") {
+                    job->state = "TimedOut"; job->error = "timed out"; outcome = "timed_out";
+                } else if (std::string(error.what()) == "capability unavailable") {
+                    job->state = "Failed"; job->error = "capability unavailable"; outcome = "failed";
+                } else {
+                    job->state = "Failed"; job->error = "capability failed"; outcome = "failed";
+                }
             }
+            job->approval_changed.notify_all();
         }
         { std::scoped_lock job_lock(job->mutex); job->done = true; }
         audit_.event(request_id, capability, decision, outcome);
     });
+    lock.unlock();
+    if (config_.decision_for(capability) == Decision::require_approval) {
+        std::unique_lock job_lock(job->mutex);
+        job->approval_changed.wait(job_lock, [&] { return job->approval_resolved || job->done; });
+    }
     return {{"protocol_version", protocol_version}, {"request_id", request_id}, {"ok", true},
             {"state", "Running"}, {"external_job_id", external_id}, {"metadata", {{"job_id", job_id}}}};
 }

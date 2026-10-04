@@ -4,22 +4,44 @@
 #include "laso/protocol.hpp"
 
 #include <istream>
+#include <atomic>
+#include <functional>
+#include <mutex>
 #include <ostream>
+#include <string>
+#include <unordered_map>
+#include <utility>
 
 namespace laso {
 
 // Adapts current Core process-worker envelopes to the endpoint's existing
-// policy-aware WorkerProtocol dispatcher. Interaction messages are not yet
-// supported; require_approval remains fail-closed in WorkerProtocol.
+// policy-aware WorkerProtocol dispatcher. Only the approval interaction is
+// wired; unsupported interaction types remain fail-closed.
 class CoreWorkerAdapter {
 public:
-    explicit CoreWorkerAdapter(WorkerProtocol& dispatcher) : dispatcher_(dispatcher) {}
+    explicit CoreWorkerAdapter(WorkerProtocol& dispatcher, unsigned interaction_timeout_ms = 60000,
+                               std::function<std::string()> interaction_id_factory = {})
+        : dispatcher_(dispatcher), interaction_timeout_ms_(interaction_timeout_ms),
+          interaction_id_factory_(std::move(interaction_id_factory)) {}
 
     [[nodiscard]] nlohmann::json handle(const core_worker_protocol::Request& request);
     int serve(std::istream& input, std::ostream& output, std::ostream& diagnostics);
 
 private:
+    bool request_approval(const PolicyInteraction& interaction);
+    bool exchange_interaction(const PolicyInteraction& interaction, const std::string& type);
+    void clear_interactions() noexcept;
+
     WorkerProtocol& dispatcher_;
+    unsigned interaction_timeout_ms_;
+    std::function<std::string()> interaction_id_factory_;
+    std::mutex interaction_io_mutex_;
+    std::mutex pending_mutex_;
+    std::unordered_map<std::string, std::string> pending_;
+    std::atomic_bool interaction_transport_failed_{false};
+    std::atomic_bool stopping_{false};
+    std::istream* interaction_input_{nullptr};
+    std::ostream* interaction_output_{nullptr};
 };
 
 } // namespace laso

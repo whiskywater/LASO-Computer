@@ -169,6 +169,95 @@ void cancel_and_framed_serve() {
                 Json::parse(second).value("request_id", std::string{}) == "serve-stop",
             "framed worker responses should preserve request correlation");
 }
+
+void approval_round_trip_and_denial() {
+    auto run = [](const std::string& decision, int expected_calls) {
+        laso::Config config;
+        config.capabilities["test.echo"] = laso::Decision::require_approval;
+        auto provider = std::make_shared<EchoProvider>();
+        laso::CapabilityRegistry registry;
+        registry.register_provider(provider);
+        laso::WorkerProtocol dispatcher(config, std::move(registry), laso::AuditLog{});
+        laso::CoreWorkerAdapter adapter(dispatcher, 200, [] { return std::string("fixture-id"); });
+        std::istringstream input(
+            "{\"protocol_version\":1,\"request_id\":\"approval-submit\",\"operation\":\"submit\",\"job_id\":\"approval-job\",\"external_job_id\":\"\",\"payload\":{\"worker_id\":\"worker-test\",\"durable_session_id\":\"session-test\",\"capability\":\"test.echo\",\"input\":{}}}\n" +
+            "{\"protocol_version\":1,\"message_type\":\"worker_response\",\"request_id\":\"interaction-fixture-id\",\"decision\":\"" + decision + "\",\"payload\":{},\"reason\":\"test decision\"}\n"
+            "{\"protocol_version\":1,\"request_id\":\"approval-shutdown\",\"operation\":\"shutdown\",\"job_id\":\"\",\"external_job_id\":\"\",\"payload\":{}}\n");
+        std::ostringstream output, diagnostics;
+        require(adapter.serve(input, output, diagnostics) == 0, "approval exchange should preserve worker transport");
+        std::istringstream frames(output.str());
+        std::string interaction_frame, submit_frame, shutdown_frame;
+        require(static_cast<bool>(std::getline(frames, interaction_frame)) &&
+                    static_cast<bool>(std::getline(frames, submit_frame)) &&
+                    static_cast<bool>(std::getline(frames, shutdown_frame)),
+                "approval exchange should emit interaction and operation responses");
+        const auto interaction = Json::parse(interaction_frame);
+        require(interaction.value("message_type", std::string{}) == "worker_request" &&
+                    interaction.value("request_type", std::string{}) == "approval" &&
+                    interaction.value("worker_id", std::string{}) == "worker-test" &&
+                    interaction.value("worker_job_id", std::string{}) == "approval-job" &&
+                    interaction.value("session_id", std::string{}) == "session-test" &&
+                    interaction.value("request_id", std::string{}) == "interaction-fixture-id",
+                "approval request should be correlated and use Core job/session identity");
+        require(Json::parse(submit_frame).value("request_id", std::string{}) == "approval-submit",
+                "submit response should follow the approval exchange");
+        require(provider->calls.load() == expected_calls,
+                "only an approved decision may invoke the capability");
+    };
+    run("approved", 1);
+    run("denied", 0);
+}
+
+void malformed_approval_fails_closed() {
+    laso::Config config;
+    config.capabilities["test.echo"] = laso::Decision::require_approval;
+    auto provider = std::make_shared<EchoProvider>();
+    laso::CapabilityRegistry registry;
+    registry.register_provider(provider);
+    laso::WorkerProtocol dispatcher(config, std::move(registry), laso::AuditLog{});
+    laso::CoreWorkerAdapter adapter(dispatcher, 100, [] { return std::string("bad-fixture-id"); });
+    std::istringstream input(
+        "{\"protocol_version\":1,\"request_id\":\"bad-submit\",\"operation\":\"submit\",\"job_id\":\"bad-job\",\"external_job_id\":\"\",\"payload\":{\"capability\":\"test.echo\",\"input\":{}}}\n"
+        "{\"protocol_version\":1,\"message_type\":\"worker_response\",\"request_id\":\"wrong-id\",\"request_id\":\"interaction-bad-fixture-id\",\"decision\":\"approved\",\"payload\":{},\"reason\":\"\"}\n");
+    std::ostringstream output, diagnostics;
+    require(adapter.serve(input, output, diagnostics) == 2 && provider->calls.load() == 0,
+            "malformed or mismatched interaction must terminate without executing");
+}
+
+void missing_approval_response_times_out_closed() {
+    laso::Config config;
+    config.capabilities["test.echo"] = laso::Decision::require_approval;
+    auto provider = std::make_shared<EchoProvider>();
+    laso::CapabilityRegistry registry;
+    registry.register_provider(provider);
+    laso::WorkerProtocol dispatcher(config, std::move(registry), laso::AuditLog{});
+    laso::CoreWorkerAdapter adapter(dispatcher, 10, [] { return std::string("timeout-fixture"); });
+    std::istringstream input(
+        "{\"protocol_version\":1,\"request_id\":\"timeout-submit\",\"operation\":\"submit\",\"job_id\":\"timeout-job\",\"external_job_id\":\"\",\"payload\":{\"capability\":\"test.echo\",\"input\":{}}}\n");
+    std::ostringstream output, diagnostics;
+    require(adapter.serve(input, output, diagnostics) == 2 && provider->calls.load() == 0,
+            "missing approval response must time out without invoking");
+}
+
+void cancel_completed_job_is_not_acknowledged() {
+    laso::Config config;
+    config.capabilities["test.echo"] = laso::Decision::allow;
+    auto provider = std::make_shared<EchoProvider>();
+    laso::CapabilityRegistry registry;
+    registry.register_provider(provider);
+    laso::WorkerProtocol dispatcher(config, std::move(registry), laso::AuditLog{});
+    laso::CoreWorkerAdapter adapter(dispatcher);
+    auto submit = request("done-submit", "submit");
+    submit.job_id = "done-job";
+    submit.payload = {{"capability", "test.echo"}, {"input", Json::object()}};
+    const auto accepted = adapter.handle(submit);
+    const auto completed = wait_for_result(adapter, accepted.value("external_job_id", std::string{}));
+    require(completed.value("state", std::string{}) == "Completed", "test job should complete before cancellation");
+    auto cancel = request("done-cancel", "cancel");
+    cancel.external_job_id = accepted.at("external_job_id").get<std::string>();
+    require(!adapter.handle(cancel).value("acknowledged", true),
+            "cancel after terminal completion must not be acknowledged");
+}
 } // namespace
 
 int main() {
@@ -176,6 +265,10 @@ int main() {
         handshake_and_dispatch();
         approval_fails_closed();
         cancel_and_framed_serve();
+        approval_round_trip_and_denial();
+        malformed_approval_fails_closed();
+        missing_approval_response_times_out_closed();
+        cancel_completed_job_is_not_acknowledged();
         return 0;
     } catch (...) {
         return 1;
