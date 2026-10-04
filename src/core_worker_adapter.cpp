@@ -182,7 +182,9 @@ int CoreWorkerAdapter::serve(std::istream& input, std::ostream& output, std::ost
     interaction_transport_failed_.store(false);
     stopping_.store(false);
     dispatcher_.set_policy_interaction_handler([this](const PolicyInteraction& interaction) {
-        return request_approval(interaction);
+        if (!interaction_input_ || !interaction_output_)
+            return PolicyInteractionResult{"cancelled", Json::object(), "interaction unavailable"};
+        return exchange_interaction(interaction, *interaction_input_, *interaction_output_);
     });
     struct Cleanup {
         CoreWorkerAdapter& adapter;
@@ -240,31 +242,32 @@ int CoreWorkerAdapter::serve(std::istream& input, std::ostream& output, std::ost
     }
 }
 
-bool CoreWorkerAdapter::request_approval(const PolicyInteraction& interaction) {
-    return exchange_interaction(interaction, "approval");
-}
-
-bool CoreWorkerAdapter::exchange_interaction(const PolicyInteraction& interaction, const std::string& type) {
+PolicyInteractionResult CoreWorkerAdapter::exchange_interaction(const PolicyInteraction& interaction,
+                                                                std::istream& input, std::ostream& output) {
+    const auto failed = [] { return PolicyInteractionResult{"cancelled", Json::object(), "interaction unavailable"}; };
     std::unique_lock io_lock(interaction_io_mutex_);
-    if (stopping_.load() || !interaction_input_ || !interaction_output_ || interaction.worker_id.empty() ||
+    if (stopping_.load() || interaction.worker_id.empty() ||
         interaction.worker_id.size() > 512 || interaction.worker_job_id.empty() ||
         interaction.worker_job_id.size() > 512 || interaction.external_job_id.empty() ||
         interaction.external_job_id.size() > 512 || interaction.session_id.size() > 512 ||
-        type != "approval") {
+        interaction.title.size() > 4096 || interaction.summary.size() > 4096 ||
+        !interaction.payload.is_object() || interaction.payload.dump().size() > 64 * 1024 ||
+        (interaction.type != "approval" && interaction.type != "permission" && interaction.type != "question") ||
+        interaction.risk.size() > 128 || interaction.category.size() > 128) {
         interaction_transport_failed_.store(true);
-        return false;
+        return failed();
     }
-    if (interaction.cancelled && interaction.cancelled()) return false;
+    if (interaction.cancelled && interaction.cancelled()) return {"cancelled", Json::object(), "interaction cancelled"};
     const auto opaque_id = interaction_id_factory_ ? interaction_id_factory_() : random_id();
     const auto request_id = "interaction-" + opaque_id;
-    if (request_id.size() > 512) { interaction_transport_failed_.store(true); return false; }
+    if (request_id.size() > 512 || request_id.empty()) { interaction_transport_failed_.store(true); return failed(); }
     {
         std::scoped_lock lock(pending_mutex_);
         if (pending_.size() >= 64 || pending_.contains(request_id)) {
             interaction_transport_failed_.store(true);
-            return false;
+            return failed();
         }
-        pending_.emplace(request_id, type);
+        pending_.emplace(request_id, interaction.type);
     }
     struct PendingCleanup {
         CoreWorkerAdapter& adapter;
@@ -278,34 +281,33 @@ bool CoreWorkerAdapter::exchange_interaction(const PolicyInteraction& interactio
     Json message{{"protocol_version", core_worker_protocol::version}, {"message_type", "worker_request"},
                  {"request_id", request_id}, {"worker_job_id", interaction.worker_job_id},
                  {"worker_id", interaction.worker_id}, {"external_job_id", interaction.external_job_id},
-                 {"session_id", interaction.session_id}, {"request_type", type},
-                 {"title", "Capability approval"},
-                 {"summary", "An endpoint capability requires a policy decision."},
-                 {"payload", {{"capability", interaction.capability}}},
+                 {"session_id", interaction.session_id}, {"request_type", interaction.type},
+                 {"title", interaction.title}, {"summary", interaction.summary},
+                 {"payload", interaction.payload},
                  {"created_at", utc_timestamp(now)}, {"deadline", utc_timestamp(wall_deadline)},
-                 {"risk", "high"}, {"category", "capability"}};
+                 {"risk", interaction.risk}, {"category", interaction.category}};
     auto encoded = message.dump(-1, ' ', false, Json::error_handler_t::strict);
     if (encoded.size() > core_worker_protocol::max_frame_bytes) {
         interaction_transport_failed_.store(true);
-        return false;
+        return failed();
     }
-    interaction_output_->write(encoded.data(), static_cast<std::streamsize>(encoded.size()));
-    interaction_output_->put('\n');
-    interaction_output_->flush();
-    if (!interaction_output_->good()) { interaction_transport_failed_.store(true); return false; }
+    output.write(encoded.data(), static_cast<std::streamsize>(encoded.size()));
+    output.put('\n');
+    output.flush();
+    if (!output.good()) { interaction_transport_failed_.store(true); return failed(); }
 
     std::string line;
-    if (!read_timed_line(*interaction_input_, line, core_worker_protocol::max_frame_bytes, deadline,
+    if (!read_timed_line(input, line, core_worker_protocol::max_frame_bytes, deadline,
                          interaction.cancelled)) {
         if (!(interaction.cancelled && interaction.cancelled())) interaction_transport_failed_.store(true);
-        return false;
+        return failed();
     }
     Json answer;
-    try { answer = parse_unique_json(line); } catch (...) { interaction_transport_failed_.store(true); return false; }
+    try { answer = parse_unique_json(line); } catch (...) { interaction_transport_failed_.store(true); return failed(); }
     static const std::set<std::string> allowed_fields{
         "protocol_version", "message_type", "request_id", "decision", "payload", "reason"};
     for (auto it = answer.begin(); it != answer.end(); ++it)
-        if (!allowed_fields.contains(it.key())) { interaction_transport_failed_.store(true); return false; }
+        if (!allowed_fields.contains(it.key())) { interaction_transport_failed_.store(true); return failed(); }
     if (!answer.contains("protocol_version") || !answer["protocol_version"].is_number_integer() ||
         answer["protocol_version"] != core_worker_protocol::version ||
         !answer.contains("message_type") || !answer["message_type"].is_string() ||
@@ -316,13 +318,22 @@ bool CoreWorkerAdapter::exchange_interaction(const PolicyInteraction& interactio
         !answer.contains("payload") || !answer["payload"].is_object() || answer["payload"].dump().size() > 64 * 1024 ||
         !answer.contains("reason") || !answer["reason"].is_string() || answer["reason"].get_ref<const std::string&>().size() > 4096) {
         interaction_transport_failed_.store(true);
-        return false;
+        return failed();
     }
     const auto decision = answer["decision"].get<std::string>();
-    const bool compatible = decision == "approved" || decision == "denied" ||
-                            decision == "cancelled" || decision == "expired";
-    if (!compatible) { interaction_transport_failed_.store(true); return false; }
-    return type == "approval" && decision == "approved";
+    const bool terminal = decision == "cancelled" || decision == "expired";
+    const bool compatible = interaction.type == "question"
+                                ? decision == "answered" || terminal
+                                : decision == "approved" || decision == "denied" || terminal;
+    {
+        std::scoped_lock lock(pending_mutex_);
+        const auto found = pending_.find(request_id);
+        if (found == pending_.end() || found->second != interaction.type || !compatible) {
+            interaction_transport_failed_.store(true);
+            return failed();
+        }
+    }
+    return {decision, answer["payload"], answer["reason"]};
 }
 
 void CoreWorkerAdapter::clear_interactions() noexcept {

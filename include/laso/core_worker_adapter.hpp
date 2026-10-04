@@ -15,8 +15,8 @@
 namespace laso {
 
 // Adapts current Core process-worker envelopes to the endpoint's existing
-// policy-aware WorkerProtocol dispatcher. Only the approval interaction is
-// wired; unsupported interaction types remain fail-closed.
+// policy-aware WorkerProtocol dispatcher. Correlated approval, permission,
+// and question exchanges share the active bounded request channel.
 class CoreWorkerAdapter {
 public:
     explicit CoreWorkerAdapter(WorkerProtocol& dispatcher, unsigned interaction_timeout_ms = 60000,
@@ -27,9 +27,12 @@ public:
     [[nodiscard]] nlohmann::json handle(const core_worker_protocol::Request& request);
     int serve(std::istream& input, std::ostream& output, std::ostream& diagnostics);
 
+    // Performs one correlated interaction exchange. Call only while Core is
+    // waiting for the response to an active worker operation.
+    PolicyInteractionResult exchange_interaction(const PolicyInteraction& interaction,
+                                                 std::istream& input, std::ostream& output);
+
 private:
-    bool request_approval(const PolicyInteraction& interaction);
-    bool exchange_interaction(const PolicyInteraction& interaction, const std::string& type);
     void clear_interactions() noexcept;
 
     WorkerProtocol& dispatcher_;

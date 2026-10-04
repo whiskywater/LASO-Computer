@@ -258,6 +258,67 @@ void cancel_completed_job_is_not_acknowledged() {
     require(!adapter.handle(cancel).value("acknowledged", true),
             "cancel after terminal completion must not be acknowledged");
 }
+
+void permission_and_question_interaction_frames() {
+    auto run = [](const std::string& type, const std::string& decision, const Json& response_payload) {
+        laso::Config config;
+        laso::CapabilityRegistry registry;
+        registry.register_provider(std::make_shared<EchoProvider>());
+        laso::WorkerProtocol dispatcher(config, std::move(registry), laso::AuditLog{});
+        laso::CoreWorkerAdapter adapter(dispatcher, 200, [] { return std::string("interaction-test-id"); });
+        laso::PolicyInteraction interaction;
+        interaction.worker_id = "worker-test";
+        interaction.worker_job_id = "job-test";
+        interaction.external_job_id = "external-test";
+        interaction.session_id = "session-test";
+        interaction.capability = "test.echo";
+        interaction.type = type;
+        interaction.title = type == "permission" ? "Permission request" : "Question";
+        interaction.summary = "Generic interaction test.";
+        interaction.payload = type == "permission" ? Json{{"resource", "test.read"}}
+                                                    : Json{{"questions", Json::array({"Continue?"})}};
+        interaction.risk = type == "permission" ? "medium" : "low";
+        interaction.category = "capability." + type;
+        std::istringstream input("{\"protocol_version\":1,\"message_type\":\"worker_response\",\"request_id\":\"interaction-interaction-test-id\",\"decision\":\"" +
+                                 decision + "\",\"payload\":" + response_payload.dump() +
+                                 ",\"reason\":\"test response\"}\n");
+        std::ostringstream output;
+        const auto response = adapter.exchange_interaction(interaction, input, output);
+        std::istringstream frames(output.str());
+        std::string frame;
+        require(static_cast<bool>(std::getline(frames, frame)), "interaction request frame should be emitted");
+        const auto request = Json::parse(frame);
+        require(request.value("message_type", std::string{}) == "worker_request" &&
+                    request.value("request_type", std::string{}) == type &&
+                    request.value("request_id", std::string{}) == "interaction-interaction-test-id" &&
+                    request.value("payload", Json::object()) == interaction.payload,
+                "interaction request must preserve type, correlation, and bounded payload");
+        require(response.decision == decision && response.payload == response_payload,
+                "interaction response must preserve decision and payload");
+    };
+    run("permission", "approved", Json::object());
+    run("permission", "denied", Json::object());
+    run("question", "answered", Json{{"answers", {{"continue", "yes"}}}});
+}
+
+void question_rejects_permission_decisions() {
+    laso::Config config;
+    laso::CapabilityRegistry registry;
+    registry.register_provider(std::make_shared<EchoProvider>());
+    laso::WorkerProtocol dispatcher(config, std::move(registry), laso::AuditLog{});
+    laso::CoreWorkerAdapter adapter(dispatcher, 200, [] { return std::string("invalid-decision-id"); });
+    laso::PolicyInteraction interaction;
+    interaction.worker_id = "worker-test";
+    interaction.worker_job_id = "job-test";
+    interaction.external_job_id = "external-test";
+    interaction.session_id = "session-test";
+    interaction.type = "question";
+    std::istringstream input(
+        "{\"protocol_version\":1,\"message_type\":\"worker_response\",\"request_id\":\"interaction-invalid-decision-id\",\"decision\":\"approved\",\"payload\":{},\"reason\":\"\"}\n");
+    std::ostringstream output;
+    const auto result = adapter.exchange_interaction(interaction, input, output);
+    require(result.decision == "cancelled", "Core-invalid question decision must fail closed");
+}
 } // namespace
 
 int main() {
@@ -269,6 +330,8 @@ int main() {
         malformed_approval_fails_closed();
         missing_approval_response_times_out_closed();
         cancel_completed_job_is_not_acknowledged();
+        permission_and_question_interaction_frames();
+        question_rejects_permission_decisions();
         return 0;
     } catch (...) {
         return 1;

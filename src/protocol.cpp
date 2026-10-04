@@ -226,10 +226,16 @@ nlohmann::json WorkerProtocol::submit(const nlohmann::json& request) {
             if (stop.stop_requested() || job->cancelled.load()) throw std::runtime_error("cancelled");
             if (policy == Decision::require_approval) {
                 if (!interaction_handler || worker_id.empty()) throw std::runtime_error("approval unavailable");
-                PolicyInteraction interaction{worker_id, job_id, job->id, session_id, capability,
-                    [job, stop] { return stop.stop_requested() || job->cancelled.load(); }};
+                PolicyInteraction interaction;
+                interaction.worker_id = worker_id;
+                interaction.worker_job_id = job_id;
+                interaction.external_job_id = job->id;
+                interaction.session_id = session_id;
+                interaction.capability = capability;
+                interaction.payload = {{"capability", capability}};
+                interaction.cancelled = [job, stop] { return stop.stop_requested() || job->cancelled.load(); };
                 bool approved = false;
-                try { approved = interaction_handler(interaction); } catch (...) { approved = false; }
+                try { approved = interaction_handler(interaction).decision == "approved"; } catch (...) { approved = false; }
                 {
                     std::scoped_lock job_lock(job->mutex);
                     job->approval_resolved = true;

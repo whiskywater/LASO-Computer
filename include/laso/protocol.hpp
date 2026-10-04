@@ -27,9 +27,20 @@ struct PolicyInteraction {
     std::string external_job_id;
     std::string session_id;
     std::string capability;
+    std::string type{"approval"};
+    std::string title{"Capability approval"};
+    std::string summary{"An endpoint capability requires a policy decision."};
+    nlohmann::json payload{nlohmann::json::object()};
+    std::string risk{"high"};
+    std::string category{"capability"};
     std::function<bool()> cancelled;
 };
-using PolicyInteractionHandler = std::function<bool(const PolicyInteraction&)>;
+struct PolicyInteractionResult {
+    std::string decision;
+    nlohmann::json payload{nlohmann::json::object()};
+    std::string reason;
+};
+using PolicyInteractionHandler = std::function<PolicyInteractionResult(const PolicyInteraction&)>;
 
 inline constexpr std::size_t max_frame_bytes = 1U << 20;
 [[nodiscard]] std::string encode_response_frame(const nlohmann::json& response);
