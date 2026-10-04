@@ -70,6 +70,7 @@ endif()
 # separate from the shipping worker and is disabled unless explicitly enabled.
 option(LASO_BUILD_ACCEPTANCE_WORKER "Build the isolated acceptance-only worker" OFF)
 if(LASO_BUILD_ACCEPTANCE_WORKER)
+  target_compile_definitions(laso_core PRIVATE LASO_ACCEPTANCE_TEST_WORKER)
   add_executable(laso-computer-acceptance src/main.cpp src/acceptance_test_provider.cpp)
   target_link_libraries(laso-computer-acceptance PRIVATE laso_core)
   target_compile_definitions(laso-computer-acceptance PRIVATE LASO_ACCEPTANCE_TEST_WORKER)

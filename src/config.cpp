@@ -75,7 +75,11 @@ const std::vector<std::string>& capability_names() {
         "clipboard.read", "clipboard.write", "window.list", "window.focus", "ui.focus", "browser.status",
         "ui.inspect", "ui.invoke", "browser.navigate", "browser.snapshot", "browser.query",
         "browser.click", "browser.fill", "browser.select", "browser.tabs", "browser.back",
-        "browser.screenshot", "shell.execute"};
+        "browser.screenshot", "shell.execute"
+#ifdef LASO_ACCEPTANCE_TEST_WORKER
+        , "acceptance.permission", "acceptance.question", "acceptance.wait"
+#endif
+    };
     return values;
 }
 
