@@ -15,6 +15,10 @@ namespace laso::core_worker_protocol {
 using Json = nlohmann::json;
 inline constexpr std::uint32_t version = 1;
 inline constexpr std::size_t max_frame_bytes = 1024 * 1024;
+inline constexpr std::size_t max_id_bytes = 512;
+inline constexpr std::size_t max_error_bytes = 512;
+inline constexpr std::size_t max_metadata_bytes = 64 * 1024;
+inline constexpr std::size_t max_artifact_references = 16;
 
 struct Request {
     std::string request_id;
@@ -41,6 +45,8 @@ inline Request parse_request_frame(std::string_view frame) {
     if (frame.empty() || frame.size() > max_frame_bytes + 1 || frame.back() != '\n')
         throw std::invalid_argument("invalid worker frame boundary");
     frame.remove_suffix(1);
+    if (frame.size() > max_frame_bytes)
+        throw std::invalid_argument("worker frame exceeds size limit");
     if (!frame.empty() && frame.back() == '\r') frame.remove_suffix(1);
     if (frame.empty() || frame.find_first_of("\r\n") != std::string_view::npos)
         throw std::invalid_argument("invalid worker frame boundary");
@@ -68,7 +74,8 @@ inline Request parse_request_frame(std::string_view frame) {
     }
     if (duplicate_key || !message.is_object()) throw std::invalid_argument("invalid worker message");
     const auto required_string = [&message](const char* name) -> const std::string& {
-        if (!message.contains(name) || !message.at(name).is_string() || message.at(name).get_ref<const std::string&>().empty())
+        if (!message.contains(name) || !message.at(name).is_string() || message.at(name).get_ref<const std::string&>().empty() ||
+            message.at(name).get_ref<const std::string&>().size() > max_id_bytes)
             throw std::invalid_argument("worker message is missing a required identifier");
         return message.at(name).get_ref<const std::string&>();
     };
@@ -87,7 +94,11 @@ inline Request parse_request_frame(std::string_view frame) {
         throw std::invalid_argument("invalid worker identifiers");
     request.job_id = message.at("job_id").get<std::string>();
     request.external_job_id = message.at("external_job_id").get<std::string>();
-    if (request.operation != "hello" && request.operation != "shutdown" && request.job_id.empty())
+    if (request.job_id.size() > max_id_bytes || request.external_job_id.size() > max_id_bytes)
+        throw std::invalid_argument("worker identifier exceeds size limit");
+    // Core assigns job IDs to submitted work. Lifecycle/polling operations use
+    // external_job_id where needed and leave job_id empty.
+    if (request.operation == "submit" && request.job_id.empty())
         throw std::invalid_argument("worker job identifier is required");
     if ((request.operation == "status" || request.operation == "result" || request.operation == "cancel") &&
         request.external_job_id.empty())
@@ -99,8 +110,11 @@ inline Request parse_request_frame(std::string_view frame) {
 }
 
 inline std::string serialize_response_frame(const Response& response) {
-    if (response.request_id.empty() || response.state.empty() ||
+    if (response.request_id.empty() || response.request_id.size() > max_id_bytes || response.state.empty() ||
+        response.state.size() > 32 || response.external_job_id.size() > max_id_bytes ||
         !response.metadata.is_object() || !response.artifacts.is_array() || !response.usage.is_object() ||
+        response.metadata.dump().size() > max_metadata_bytes || response.artifacts.size() > max_artifact_references ||
+        response.error.size() > max_error_bytes ||
         (!response.ok && response.error.empty()))
         throw std::invalid_argument("invalid worker response");
     Json message{{"protocol_version", version}, {"request_id", response.request_id}, {"ok", response.ok},

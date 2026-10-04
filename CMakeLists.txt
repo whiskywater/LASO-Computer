@@ -12,6 +12,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_library(laso_core
   src/config.cpp
   src/protocol.cpp
+  src/core_worker_adapter.cpp
   src/plugin.cpp
   src/audit.cpp
   src/windows_platform.cpp
@@ -47,6 +48,10 @@ if(BUILD_TESTING)
   target_link_libraries(laso-tests PRIVATE laso_core)
   target_compile_options(laso-tests PRIVATE /W4 /permissive- /EHsc /utf-8)
   add_test(NAME laso-tests COMMAND laso-tests)
+  add_executable(laso-core-worker-adapter-tests tests/core_worker_adapter_tests.cpp)
+  target_link_libraries(laso-core-worker-adapter-tests PRIVATE laso_core)
+  target_compile_options(laso-core-worker-adapter-tests PRIVATE /W4 /permissive- /EHsc /utf-8)
+  add_test(NAME laso-core-worker-adapter-tests COMMAND laso-core-worker-adapter-tests)
   add_executable(laso-broker-tests tests/broker_tests.cpp)
   target_link_libraries(laso-broker-tests PRIVATE laso_broker_core)
   target_compile_options(laso-broker-tests PRIVATE /W4 /permissive- /EHsc /utf-8)

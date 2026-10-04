@@ -2,7 +2,7 @@
 
 LASO-Computer is a Windows endpoint worker for LASO. It runs as a supervised child process and provides a local security boundary for authorized computer-use operations. LASO owns orchestration, durable jobs and sessions, workflow policy, and approval records; this program owns local Windows interaction and rechecks endpoint policy before every action.
 
-The public implementation is native C++20 for Windows 10/11 x64. It has no Go, Python, .NET, Java, or Electron runtime dependency. It opens no inbound listener and does not implement remote enrollment or outbound endpoint transport. Current public LASO `main` was inspected at `ef072429c96eb9b0964e56a561591a37ccb68fbd`; that revision did not contain the worker-process v1 contract, so interoperability against that revision and approval framing are not yet established. The protocol code in this repository is a local implementation pending a verifiable upstream contract.
+The public implementation is native C++20 for Windows 10/11 x64. It has no Go, Python, .NET, Java, or Electron runtime dependency. It opens no inbound listener and does not implement remote enrollment or outbound endpoint transport. Its stdin/stdout worker supports the current process-worker v1 lifecycle operations: `hello`, `submit`, `status`, `result`, `cancel`, and `shutdown`, using bounded newline-delimited JSON. Submitted capability inputs still pass through endpoint-side policy. Correlated approval, permission, and question interactions are not implemented; `require_approval` therefore fails closed.
 
 ## What works in this build
 

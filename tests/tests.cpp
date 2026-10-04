@@ -381,9 +381,17 @@ void core_worker_protocol_tests() {
             "duplicate JSON members should be rejected");
     require(rejects("{\"protocol_version\":1,\"request_id\":\"r\",\"operation\":\"submit\",\"job_id\":\"j\",\"external_job_id\":\"\",\"payload\":{\"nested\":{\"a\":1,\"a\":2}}}\n"),
             "nested duplicate JSON members should be rejected");
+    const auto status = protocol::parse_request_frame(
+        "{\"protocol_version\":1,\"request_id\":\"req-status\",\"operation\":\"status\",\"job_id\":\"\",\"external_job_id\":\"external-7\",\"payload\":{}}\n");
+    const auto result_poll = protocol::parse_request_frame(
+        "{\"protocol_version\":1,\"request_id\":\"req-result\",\"operation\":\"result\",\"job_id\":\"\",\"external_job_id\":\"external-7\",\"payload\":{}}\n");
     const auto cancellation = protocol::parse_request_frame(
-        "{\"protocol_version\":1,\"request_id\":\"req-cancel\",\"operation\":\"cancel\",\"job_id\":\"job-7\",\"external_job_id\":\"external-7\",\"payload\":{}}\n");
-    require(cancellation.operation == "cancel" && cancellation.external_job_id == "external-7",
+        "{\"protocol_version\":1,\"request_id\":\"req-cancel\",\"operation\":\"cancel\",\"job_id\":\"\",\"external_job_id\":\"external-7\",\"payload\":{}}\n");
+    require(status.operation == "status" && status.job_id.empty() && status.external_job_id == "external-7",
+            "Core status should target an external job without a job identifier");
+    require(result_poll.operation == "result" && result_poll.job_id.empty() && result_poll.external_job_id == "external-7",
+            "Core result polling should target an external job without a job identifier");
+    require(cancellation.operation == "cancel" && cancellation.job_id.empty() && cancellation.external_job_id == "external-7",
             "Core cancellation should target the correlated external job");
     require(rejects("{\"protocol_version\":1,\"request_id\":\"r\",\"operation\":\"cancel\",\"job_id\":\"j\",\"external_job_id\":\"\",\"payload\":{}}\n"),
             "cancel request without external job id should be rejected");

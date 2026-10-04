@@ -1,6 +1,7 @@
 #include "laso/config.hpp"
 #include "laso/platform.hpp"
 #include "laso/protocol.hpp"
+#include "laso/core_worker_adapter.hpp"
 #include "laso/audit.hpp"
 #include "laso/playwright.hpp"
 
@@ -86,7 +87,8 @@ int wmain(int argc, wchar_t** argv) {
             registry.register_provider(std::move(playwright));
         }
         laso::WorkerProtocol worker(config, std::move(registry), laso::AuditLog{});
-        return worker.serve(std::cin, std::cout, std::cerr);
+        laso::CoreWorkerAdapter adapter(worker);
+        return adapter.serve(std::cin, std::cout, std::cerr);
     } catch (const std::exception& error) {
         std::cerr << "laso-computer: " << error.what() << '\n';
         return 2;
