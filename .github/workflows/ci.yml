@@ -31,7 +31,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: laso-computer-${{ matrix.configuration }}-${{ github.sha }}
-          path:
+          path: |
             build/${{ matrix.configuration }}/laso-computer.exe
             build/${{ matrix.configuration }}/laso-computer-acceptance.exe
           if-no-files-found: error
