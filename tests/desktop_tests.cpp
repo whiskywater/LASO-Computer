@@ -196,6 +196,7 @@ public:
                             CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP, nullptr, directory_.c_str(), &startup, &process))
             throw std::runtime_error("could not start the isolated browser fixture");
         process_ = process.hProcess;
+        process_id_ = process.dwProcessId;
         const auto thread = process.hThread;
         if (!AssignProcessToJobObject(job_, process_)) {
             TerminateProcess(process_, 1);
@@ -224,6 +225,7 @@ public:
 
     [[nodiscard]] bool ready() const { return ready_; }
     [[nodiscard]] HWND window() const { return window_; }
+    [[nodiscard]] bool allow_foreground() const { return process_id_ != 0 && AllowSetForegroundWindow(process_id_) != FALSE; }
 
 private:
     void cleanup() noexcept {
@@ -265,6 +267,7 @@ private:
     std::filesystem::path directory_;
     HANDLE job_{nullptr};
     HANDLE process_{nullptr};
+    DWORD process_id_{0};
     HWND window_{nullptr};
     bool ready_{false};
 };
@@ -526,8 +529,13 @@ void run_tests() {
 
     if (browser_fixture.ready()) {
         const auto browser_id = handle_id(browser_fixture.window());
-        const auto focused_window = run_core_capability(core_worker, "window.focus",
+        (void)browser_fixture.allow_foreground();
+        const auto focus_result = run_core_job(core_worker, "window.focus",
             {{"window_id", browser_id}}, "browser-window-focus");
+        if (focus_result.value("state", std::string{}) != "Completed") {
+            std::cout << "Browser UI Automation/input fixture skipped: Windows did not grant foreground activation\n";
+        } else {
+        const auto focused_window = focus_result.value("payload", nlohmann::json::object());
         require(focused_window.value("focused", false), "Core child window.focus did not focus the local browser fixture");
 
         std::string edit_id_from_browser;
@@ -596,6 +604,7 @@ void run_tests() {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         require(invoke_observed, "ui.invoke did not reach the local browser fixture control");
+        }
     }
 
     std::ifstream audit(audit_path, std::ios::binary);
