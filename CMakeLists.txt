@@ -9,7 +9,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-add_library(laso_core
+set(LASO_CORE_SOURCES
   src/config.cpp
   src/protocol.cpp
   src/core_worker_adapter.cpp
@@ -18,10 +18,16 @@ add_library(laso_core
   src/windows_platform.cpp
   src/playwright.cpp
 )
-target_include_directories(laso_core PUBLIC include third_party/nlohmann_json/include)
-target_compile_definitions(laso_core PUBLIC UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_compile_options(laso_core PRIVATE /W4 /permissive- /EHsc /utf-8)
-target_link_libraries(laso_core PUBLIC User32 Gdi32 Shell32 Ole32 Windowscodecs Advapi32 Crypt32 Uiautomationcore Userenv Winhttp Ws2_32 Iphlpapi)
+
+function(add_laso_computer_core target)
+  add_library(${target} ${LASO_CORE_SOURCES})
+  target_include_directories(${target} PUBLIC include third_party/nlohmann_json/include)
+  target_compile_definitions(${target} PUBLIC UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(${target} PRIVATE /W4 /permissive- /EHsc /utf-8)
+  target_link_libraries(${target} PUBLIC User32 Gdi32 Shell32 Ole32 Windowscodecs Advapi32 Crypt32 Uiautomationcore Userenv Winhttp Ws2_32 Iphlpapi)
+endfunction()
+
+add_laso_computer_core(laso_core)
 
 # The privileged broker has a separate, fixed RPC surface. Keep its protocol
 # library independent from the endpoint runtime and expose no generic executor.
@@ -41,6 +47,18 @@ target_compile_options(LASOComputerBrokerCtl PRIVATE /W4 /permissive- /EHsc /utf
 add_executable(laso-computer src/main.cpp)
 target_link_libraries(laso-computer PRIVATE laso_core)
 target_compile_options(laso-computer PRIVATE /W4 /permissive- /EHsc /utf-8)
+
+option(LASO_BUILD_ACCEPTANCE_WORKER "Build the isolated acceptance-only worker" OFF)
+if(LASO_BUILD_ACCEPTANCE_WORKER)
+  # Build an isolated runtime library as well as an isolated executable. The
+  # shipping laso_core must not gain acceptance-only capability names.
+  add_laso_computer_core(laso_core_acceptance)
+  target_compile_definitions(laso_core_acceptance PRIVATE LASO_ACCEPTANCE_TEST_WORKER)
+  add_executable(laso-computer-acceptance src/main.cpp src/acceptance_test_provider.cpp)
+  target_link_libraries(laso-computer-acceptance PRIVATE laso_core_acceptance)
+  target_compile_definitions(laso-computer-acceptance PRIVATE LASO_ACCEPTANCE_TEST_WORKER)
+  target_compile_options(laso-computer-acceptance PRIVATE /W4 /permissive- /EHsc /utf-8)
+endif()
 
 include(CTest)
 if(BUILD_TESTING)
@@ -64,15 +82,12 @@ if(BUILD_TESTING)
   add_executable(laso-restricted-token-probe tests/restricted_token_probe.cpp)
   target_link_libraries(laso-restricted-token-probe PRIVATE Advapi32)
   target_compile_options(laso-restricted-token-probe PRIVATE /W4 /permissive- /EHsc /utf-8)
-endif()
-
-# This opt-in executable is only for end-to-end protocol acceptance. It is
-# separate from the shipping worker and is disabled unless explicitly enabled.
-option(LASO_BUILD_ACCEPTANCE_WORKER "Build the isolated acceptance-only worker" OFF)
-if(LASO_BUILD_ACCEPTANCE_WORKER)
-  target_compile_definitions(laso_core PRIVATE LASO_ACCEPTANCE_TEST_WORKER)
-  add_executable(laso-computer-acceptance src/main.cpp src/acceptance_test_provider.cpp)
-  target_link_libraries(laso-computer-acceptance PRIVATE laso_core)
-  target_compile_definitions(laso-computer-acceptance PRIVATE LASO_ACCEPTANCE_TEST_WORKER)
-  target_compile_options(laso-computer-acceptance PRIVATE /W4 /permissive- /EHsc /utf-8)
+  if(LASO_BUILD_ACCEPTANCE_WORKER)
+    add_test(NAME laso-computer-acceptance-isolated-startup
+      COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass
+        -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/acceptance_worker_smoke.ps1
+        -AcceptanceExecutable $<TARGET_FILE:laso-computer-acceptance>
+        -ShippingExecutable $<TARGET_FILE:laso-computer>)
+    set_tests_properties(laso-computer-acceptance-isolated-startup PROPERTIES TIMEOUT 30)
+  endif()
 endif()

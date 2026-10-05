@@ -32,16 +32,26 @@ std::wstring get_arg(int argc, wchar_t** argv, int& i) {
 
 int wmain(int argc, wchar_t** argv) {
     try {
-        std::filesystem::path config_path = laso::Config::default_path();
+        // Core starts process workers with an empty inherited environment.
+        // Resolve LOCALAPPDATA only when the caller relies on the interactive
+        // default; an explicit --config path must work in that environment.
+        std::filesystem::path config_path;
+        bool config_path_supplied = false;
         std::wstring command;
         for (int i = 1; i < argc; ++i) {
-            if (std::wstring_view(argv[i]) == L"--config") config_path = get_arg(argc, argv, i);
+            if (std::wstring_view(argv[i]) == L"--config") {
+                config_path = get_arg(argc, argv, i);
+                config_path_supplied = true;
+            }
             else if (std::wstring_view(argv[i]) == L"--status" || std::wstring_view(argv[i]) == L"--capabilities" ||
                      std::wstring_view(argv[i]) == L"--init-config" || std::wstring_view(argv[i]) == L"--check-config") {
                 if (!command.empty()) { usage(); return 2; }
                 command = argv[i];
             } else { usage(); return 2; }
         }
+        if (config_path_supplied && config_path.empty())
+            throw std::runtime_error("--config path must not be empty");
+        if (!config_path_supplied) config_path = laso::Config::default_path();
         if (command == L"--init-config") {
             laso::Config{}.save_example(config_path);
             std::wcout << L"Created deny-by-default config at " << config_path.wstring() << L"\n";
