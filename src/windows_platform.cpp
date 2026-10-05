@@ -683,7 +683,7 @@ std::vector<CapabilityDescriptor> WindowsPlatform::capabilities() const {
             schema(Json{{"text", Json{{"type", "string"}, {"maxLength", 1024}}}}, {"text"}), true, {}},
         {"keyboard.key", "Press one supported key in the foreground ChatGPT browser", "interaction",
             schema(Json{{"key", Json{{"enum", Json{"ENTER", "ESC", "TAB", "SPACE", "BACKSPACE", "DELETE",
-                                                        "UP", "DOWN", "LEFT", "RIGHT", "HOME", "END"}}}}, {"key"}), true, {}},
+                                                        "UP", "DOWN", "LEFT", "RIGHT", "HOME", "END"}}}}}, {"key"}), true, {}},
         {"clipboard.read", "Read plain-text clipboard data", "sensitive_read", schema(Json::object()), true, {}},
         {"clipboard.write", "Replace plain-text clipboard data", "sensitive_write",
             schema(Json{{"text", Json{{"type", "string"}, {"maxLength", 1048576}}}}, {"text"}), true, {}},
