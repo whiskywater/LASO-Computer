@@ -387,8 +387,8 @@ HWND window_handle(const nlohmann::json& args, bool use_foreground_when_missing 
 nlohmann::json inspect_ui(const nlohmann::json& args, const std::function<bool()>& cancelled) {
     ComApartment apartment;
     const auto window = window_handle(args, true);
-    if (!is_chatgpt_window(window) || GetForegroundWindow() != window)
-        throw std::runtime_error("window is not the foreground ChatGPT browser window");
+    if (!is_chatgpt_window(window))
+        throw std::runtime_error("window is not an origin-verified ChatGPT browser window");
     constexpr std::size_t max_results = 256;
     constexpr std::size_t max_visited = 4096;
     constexpr int max_depth = 16;
@@ -420,7 +420,6 @@ nlohmann::json inspect_ui(const nlohmann::json& args, const std::function<bool()
     std::size_t visited = 0;
     while (!pending.empty() && elements.size() < max_results && visited < max_visited) {
         require_cancelled(cancelled);
-        if (GetForegroundWindow() != window) throw std::runtime_error("ChatGPT window lost foreground focus during inspection");
         auto current = std::move(pending.back());
         pending.pop_back();
         ++visited;
@@ -836,7 +835,7 @@ std::vector<CapabilityDescriptor> WindowsPlatform::capabilities() const {
         {"ui.focus", "Focus one UI Automation control by target", "interaction",
             schema(Json{{"window_id", Json{{"type", "string"}, {"minLength", 1}, {"maxLength", 256}}},
                         {"target", Json{{"type", "string"}, {"minLength", 1}, {"maxLength", 512}}}}, {"window_id", "target"}), true, {}},
-        {"ui.inspect", "Inspect a bounded foreground ChatGPT UI Automation control tree", "sensitive_read",
+        {"ui.inspect", "Inspect a bounded origin-verified ChatGPT UI Automation control tree", "sensitive_read",
             schema(Json{{"window_id", Json{{"type", "string"}, {"minLength", 1}, {"maxLength", 256}}}}), true, {}},
         {"ui.invoke", "Activate a uniquely matched UI Automation control", "interaction",
             schema(Json{{"window_id", Json{{"type", "string"}, {"minLength", 1}, {"maxLength", 256}}},
