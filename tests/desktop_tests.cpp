@@ -168,7 +168,9 @@ public:
         html << "<!doctype html><html><head><meta charset='utf-8'><title>ChatGPT - LASO Lane 4 UIA Fixture</title></head>"
                 "<body><form id='chat-form'><label for='chat'>Message</label>"
                 "<textarea id='chat' aria-label='Lane 4 fixture message'></textarea>"
+                "<span role='note' aria-label='Lane 4 fixture message'>duplicate message label</span>"
                 "<button id='send' aria-label='Send fixture'>Send fixture</button>"
+                "<button aria-label='Send fixture' style='position:fixed;left:-10000px;top:-10000px'>Hidden send duplicate</button>"
                 "<button id='submit' type='submit' aria-label='Submit fixture'>Submit fixture</button></form>"
                 "<button id='disabled' disabled aria-label='Disabled fixture'>Disabled fixture</button>"
                 "<div id='status' aria-live='polite'>LANE4-READY</div>"
@@ -606,7 +608,7 @@ void run_tests() {
             browser_tree = run_core_capability(core_worker, "ui.inspect",
                 nlohmann::json::object(),
                 "browser-ui-inspect-" + std::to_string(attempt));
-            require(browser_tree.at("elements").size() <= 32, "browser UI Automation exceeded its node bound");
+            require(browser_tree.at("elements").size() <= 128, "browser UI Automation exceeded its result bound");
             for (const auto& item : browser_tree.at("elements")) {
                 require(item.value("name", std::string{}).size() <= 4 * 256 &&
                             item.value("automation_id", std::string{}).size() <= 4 * 128,
@@ -628,6 +630,10 @@ void run_tests() {
         nlohmann::json focus_args{{"window_id", browser_id}, {"target", edit_target}};
         const auto control = run_core_capability(core_worker, "ui.focus", focus_args, "browser-control-focus");
         require(control.value("performed", "") == "focus", "UI Automation did not focus the local browser control");
+        const auto named_control = run_core_capability(core_worker, "ui.focus",
+            {{"window_id", browser_id}, {"target", "Lane 4 fixture message"}}, "browser-control-focus-by-name");
+        require(named_control.value("performed", "") == "focus",
+                "UI Automation did not prefer the visible focusable control for a duplicated accessible name");
         run_core_capability(core_worker, "keyboard.type", {{"text", "LANE4-TYPED-OK"}}, "browser-keyboard-type");
 
         bool typed_text_observed = false;
@@ -661,6 +667,10 @@ void run_tests() {
                 "UI Automation did not expose the local browser fixture's send control");
         const auto invoked = run_core_capability(core_worker, "ui.invoke", invoke_args, "browser-ui-invoke");
         require(invoked.value("performed", "") == "click", "UI Automation did not click the local browser fixture control");
+        const auto named_invoked = run_core_capability(core_worker, "ui.invoke",
+            {{"window_id", browser_id}, {"target", "Send fixture"}, {"action", "click"}}, "browser-ui-invoke-by-name");
+        require(named_invoked.value("performed", "") == "click",
+                "UI Automation did not prefer the visible actionable control for a duplicated accessible name");
         bool invoke_observed = false;
         for (int attempt = 0; attempt < 40; ++attempt) {
             browser_tree = run_core_capability(core_worker, "ui.inspect",

@@ -350,23 +350,41 @@ nlohmann::json inspect_ui(const nlohmann::json& args, const std::function<bool()
     const auto window = window_handle(args, true);
     if (!is_chatgpt_window(window) || GetForegroundWindow() != window)
         throw std::runtime_error("window is not the foreground ChatGPT browser window");
-    constexpr int max_nodes = 32;
-    constexpr int max_depth = 8;
+    constexpr std::size_t max_results = 128;
+    constexpr std::size_t max_visited = 4096;
+    constexpr int max_depth = 16;
     ComPtr<IUIAutomation> automation;
     ComPtr<IUIAutomationElement> root;
     ComPtr<IUIAutomationTreeWalker> walker;
     if (FAILED(CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&automation))) ||
         FAILED(automation->ElementFromHandle(window, &root)) || FAILED(automation->get_ControlViewWalker(&walker)))
         throw std::runtime_error("Windows automation unavailable");
+
+    // Spend the bounded result budget on the active page instead of browser chrome when possible.
+    ComPtr<IUIAutomationElement> traversal_root = root;
+    VARIANT document_type;
+    VariantInit(&document_type);
+    document_type.vt = VT_I4;
+    document_type.lVal = UIA_DocumentControlTypeId;
+    ComPtr<IUIAutomationCondition> document_condition;
+    if (SUCCEEDED(automation->CreatePropertyCondition(UIA_ControlTypePropertyId, document_type, &document_condition)) &&
+        document_condition) {
+        ComPtr<IUIAutomationElement> document;
+        if (SUCCEEDED(root->FindFirst(TreeScope_Subtree, document_condition.Get(), &document)) && document)
+            traversal_root = std::move(document);
+    }
+    VariantClear(&document_type);
+
     struct Node { ComPtr<IUIAutomationElement> element; int depth; };
-    std::vector<Node> pending{{root, 0}};
+    std::vector<Node> pending{{traversal_root, 0}};
     nlohmann::json elements = nlohmann::json::array();
-    bool truncated = false;
-    while (!pending.empty() && elements.size() < static_cast<std::size_t>(max_nodes)) {
+    std::size_t visited = 0;
+    while (!pending.empty() && elements.size() < max_results && visited < max_visited) {
         require_cancelled(cancelled);
         if (GetForegroundWindow() != window) throw std::runtime_error("ChatGPT window lost foreground focus during inspection");
         auto current = std::move(pending.back());
         pending.pop_back();
+        ++visited;
         BSTR name = nullptr, automation_id = nullptr;
         CONTROLTYPEID control_type{};
         BOOL enabled = FALSE, offscreen = FALSE;
@@ -377,11 +395,13 @@ nlohmann::json inspect_ui(const nlohmann::json& args, const std::function<bool()
         current.element->get_CurrentIsOffscreen(&offscreen);
         const auto [element_name, name_truncated] = bounded_bstr_utf8(name, 256);
         const auto [element_automation_id, automation_id_truncated] = bounded_bstr_utf8(automation_id, 128);
-        elements.push_back({{"name", element_name}, {"name_truncated", name_truncated},
-                            {"automation_id", element_automation_id},
-                            {"automation_id_truncated", automation_id_truncated},
-                            {"control_type", control_type}, {"enabled", enabled != FALSE}, {"offscreen", offscreen != FALSE},
-                            {"depth", current.depth}});
+        if (!offscreen && (!element_name.empty() || !element_automation_id.empty())) {
+            elements.push_back({{"name", element_name}, {"name_truncated", name_truncated},
+                                {"automation_id", element_automation_id},
+                                {"automation_id_truncated", automation_id_truncated},
+                                {"control_type", control_type}, {"enabled", enabled != FALSE}, {"offscreen", false},
+                                {"depth", current.depth}});
+        }
         if (current.depth >= max_depth) continue;
         ComPtr<IUIAutomationElement> child;
         if (FAILED(walker->GetFirstChildElement(current.element.Get(), &child)) || !child) continue;
@@ -394,7 +414,7 @@ nlohmann::json inspect_ui(const nlohmann::json& args, const std::function<bool()
         }
         for (auto it = siblings.rbegin(); it != siblings.rend(); ++it) pending.push_back({*it, current.depth + 1});
     }
-    truncated = truncated || !pending.empty();
+    const bool truncated = !pending.empty() || visited >= max_visited;
     return {{"elements", std::move(elements)}, {"truncated", truncated}};
 }
 
@@ -409,8 +429,8 @@ nlohmann::json invoke_ui(const nlohmann::json& args, const std::function<bool()>
     if (FAILED(CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&automation))) ||
         FAILED(automation->ElementFromHandle(window, &root))) throw std::runtime_error("Windows automation unavailable");
     const auto target_name = widen(args.at("target").get<std::string>());
-    ComPtr<IUIAutomationElementArray> matches;
-    auto find_matches = [&](PROPERTYID property) {
+    const auto action = args.at("action").get<std::string>();
+    auto find_actionable = [&](PROPERTYID property, bool& had_matches) -> ComPtr<IUIAutomationElement> {
         VARIANT value; VariantInit(&value);
         value.vt = VT_BSTR;
         value.bstrVal = SysAllocStringLen(target_name.data(), static_cast<UINT>(target_name.size()));
@@ -420,20 +440,45 @@ nlohmann::json invoke_ui(const nlohmann::json& args, const std::function<bool()>
             throw std::runtime_error("Windows automation unavailable");
         }
         VariantClear(&value);
-        matches.Reset();
+        ComPtr<IUIAutomationElementArray> matches;
         if (FAILED(root->FindAll(TreeScope_Subtree, condition.Get(), &matches)) || !matches)
             throw std::runtime_error("Windows automation target not found");
         int found = 0;
         if (FAILED(matches->get_Length(&found))) throw std::runtime_error("Windows automation target not found");
-        return found;
+        had_matches = found > 0;
+        std::vector<ComPtr<IUIAutomationElement>> actionable;
+        for (int index = 0; index < found; ++index) {
+            ComPtr<IUIAutomationElement> candidate;
+            if (FAILED(matches->GetElement(index, &candidate)) || !candidate) continue;
+            BOOL enabled = FALSE, offscreen = TRUE;
+            if (FAILED(candidate->get_CurrentIsEnabled(&enabled)) || !enabled ||
+                FAILED(candidate->get_CurrentIsOffscreen(&offscreen)) || offscreen)
+                continue;
+            if (action == "focus") {
+                BOOL focusable = FALSE;
+                if (FAILED(candidate->get_CurrentIsKeyboardFocusable(&focusable)) || !focusable) continue;
+            } else if (action == "click" || action == "submit") {
+                ComPtr<IUIAutomationInvokePattern> invoke_pattern;
+                if (FAILED(candidate->GetCurrentPatternAs(UIA_InvokePatternId, IID_PPV_ARGS(&invoke_pattern))) ||
+                    !invoke_pattern)
+                    continue;
+            }
+            actionable.push_back(std::move(candidate));
+        }
+        if (actionable.size() > 1) throw std::runtime_error("Windows automation target is ambiguous");
+        return actionable.empty() ? ComPtr<IUIAutomationElement>{} : actionable.front();
     };
-    int count = find_matches(UIA_AutomationIdPropertyId);
-    if (count == 0) count = find_matches(UIA_NamePropertyId);
-    if (count != 1) throw std::runtime_error(count == 0 ? "Windows automation target not found" : "Windows automation target is ambiguous");
+
+    bool id_matches = false;
+    ComPtr<IUIAutomationElement> target = find_actionable(UIA_AutomationIdPropertyId, id_matches);
+    if (!target) {
+        if (id_matches) throw std::runtime_error("Windows automation target is not actionable");
+        bool name_matches = false;
+        target = find_actionable(UIA_NamePropertyId, name_matches);
+        if (!target) throw std::runtime_error(name_matches ? "Windows automation target is not actionable"
+                                                          : "Windows automation target not found");
+    }
     if (GetForegroundWindow() != window) throw std::runtime_error("ChatGPT window lost foreground focus");
-    ComPtr<IUIAutomationElement> target;
-    if (FAILED(matches->GetElement(0, &target)) || !target) throw std::runtime_error("Windows automation target not found");
-    const auto action = args.at("action").get<std::string>();
     require_cancelled(cancelled);
     if (GetForegroundWindow() != window) throw std::runtime_error("ChatGPT window lost foreground focus");
     if (action == "focus") {
