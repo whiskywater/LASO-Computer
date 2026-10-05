@@ -389,7 +389,7 @@ nlohmann::json inspect_ui(const nlohmann::json& args, const std::function<bool()
     const auto window = window_handle(args, true);
     if (!is_chatgpt_window(window) || GetForegroundWindow() != window)
         throw std::runtime_error("window is not the foreground ChatGPT browser window");
-    constexpr std::size_t max_results = 128;
+    constexpr std::size_t max_results = 256;
     constexpr std::size_t max_visited = 4096;
     constexpr int max_depth = 16;
     ComPtr<IUIAutomation> automation;

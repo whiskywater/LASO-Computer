@@ -608,7 +608,7 @@ void run_tests() {
             browser_tree = run_core_capability(core_worker, "ui.inspect",
                 nlohmann::json::object(),
                 "browser-ui-inspect-" + std::to_string(attempt));
-            require(browser_tree.at("elements").size() <= 128, "browser UI Automation exceeded its result bound");
+            require(browser_tree.at("elements").size() <= 256, "browser UI Automation exceeded its result bound");
             for (const auto& item : browser_tree.at("elements")) {
                 require(item.value("name", std::string{}).size() <= 4 * 256 &&
                             item.value("automation_id", std::string{}).size() <= 4 * 128,
