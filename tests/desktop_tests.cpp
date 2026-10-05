@@ -375,11 +375,19 @@ void run_tests() {
     if (browser_fixture.ready()) {
         const auto browser_id = handle_id(browser_fixture.window());
         bool browser_found = false;
-        for (const auto& item : list.at("windows")) {
-            if (item.value("window_id", "") != browser_id) continue;
-            browser_found = true;
-            require(item.value("title", std::string{}) == "ChatGPT" && item.contains("active"),
-                    "browser discovery must redact conversation titles and expose only active state");
+        auto current_windows = list.at("windows");
+        for (int attempt = 0; attempt < 40 && !browser_found; ++attempt) {
+            for (const auto& item : current_windows) {
+                if (item.value("window_id", std::string{}) != browser_id) continue;
+                browser_found = true;
+                require(item.value("title", std::string{}) == "ChatGPT" && item.contains("active"),
+                        "browser discovery must redact conversation titles and expose only active state");
+            }
+            if (!browser_found) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                current_windows = run_core_capability(core_worker, "window.list", nlohmann::json::object(),
+                    "window-list-browser-ready-" + std::to_string(attempt + 1)).at("windows");
+            }
         }
         require(browser_found, "browser discovery did not expose the isolated supported-browser fixture");
     }
