@@ -34,5 +34,6 @@ jobs:
           path: |
             build/${{ matrix.configuration }}/laso-computer.exe
             build/${{ matrix.configuration }}/laso-computer-acceptance.exe
+            build/${{ matrix.configuration }}/laso-desktop-tests.exe
           if-no-files-found: error
           retention-days: 1

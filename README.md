@@ -30,6 +30,8 @@ Before a long unattended development task, run `tools\dev-preflight.ps1`. It nev
 .\build\Debug\laso-desktop-tests.exe
 ```
 
+The interactive fixture starts Edge or Chrome with a fresh temporary profile and a local ChatGPT-labeled HTML fixture; it does not use the user's browser profile or network. It sends browser discovery, window/UI Automation operations, and keyboard input through Core's process-worker adapter with non-empty child-job arguments, then closes only that isolated browser job. It also checks argument limits, unrelated-window rejection, default deny, and approval fail-closed behavior. `window.list` only reports ChatGPT browser windows and returns generic labels; UI Automation is restricted to the foreground ChatGPT window and capped by node count, depth, and per-field text length. The browser interaction portion is skipped if Edge/Chrome is unavailable. The native target accepts up to 4096 bytes for schema compatibility, then applies a 1024-byte per-call SendInput bound.
+
 ## Configuration and use
 
 Run the executable from a terminal:
@@ -42,6 +44,8 @@ notepad "$env:LOCALAPPDATA\LASO-Computer\config.json"
 ```
 
 The configuration lives under the current user's Local AppData by default. New configurations deny every capability. Grant only the exact capabilities needed. `require_approval` remains fail-closed unless the worker receives a verified correlated approval from Core. Providers that opt into permission or question interactions must proceed only after the corresponding accepted response (`approved` or `answered`). Do not place credentials in configuration. `--check-config` reports actual decisions, non-denied capabilities, process allowlist count, and plugin paths without printing secrets.
+
+For an explicitly scoped local chat orchestrator, review [the chat-orchestrator-v1 endpoint policy](examples/chat-orchestrator-v1.md) and pass its JSON file with `--config`. It allows browser status and ChatGPT-window discovery; bounded UI inspection, window/control focus, control invocation, and keyboard input require correlated Core approval. Conversation titles are hidden. Use `ui.invoke` with `action: "invoke"`; the current Core profile has no value argument for `set_value`. Screen capture, pointer, clipboard, shell, and Playwright browser actions remain denied. The policy test runs in CTest.
 
 Without a status/configuration option, the executable reads and writes bounded JSON Lines worker-protocol messages on standard input/output. Diagnostics are written to standard error. Job `Failed`, `Cancelled`, and `TimedOut` states are represented as valid job results; protocol operation errors are separate. Optional durable-session context is accepted where defined by the process-worker v1 contract. The worker protocol has been exercised against the current Core process manager for correlated permission allow/deny, question answer, cooperative cancellation, graceful shutdown, and `browser.status`; this does not establish browser containment or production readiness.
 

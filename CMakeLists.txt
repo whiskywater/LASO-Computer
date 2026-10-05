@@ -82,6 +82,13 @@ if(BUILD_TESTING)
   add_executable(laso-restricted-token-probe tests/restricted_token_probe.cpp)
   target_link_libraries(laso-restricted-token-probe PRIVATE Advapi32)
   target_compile_options(laso-restricted-token-probe PRIVATE /W4 /permissive- /EHsc /utf-8)
+  add_test(NAME chat-orchestrator-endpoint-policy
+    COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass
+      -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/chat_orchestrator_policy_tests.ps1
+      -ConfigPath ${CMAKE_CURRENT_SOURCE_DIR}/examples/chat-orchestrator-v1.json)
+  add_test(NAME chat-orchestrator-config-load
+    COMMAND $<TARGET_FILE:laso-computer> --check-config
+      --config ${CMAKE_CURRENT_SOURCE_DIR}/examples/chat-orchestrator-v1.json)
   if(LASO_BUILD_ACCEPTANCE_WORKER)
     add_test(NAME laso-computer-acceptance-isolated-startup
       COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass

@@ -16,9 +16,11 @@
 #include <cwctype>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <map>
 #include <memory>
 #include <regex>
+#include <set>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -69,6 +71,19 @@ bool is_browser_window(HWND window) {
     static constexpr std::array<std::wstring_view, 6> browsers{
         L"msedge.exe", L"chrome.exe", L"firefox.exe", L"brave.exe", L"opera.exe", L"vivaldi.exe"};
     return std::find(browsers.begin(), browsers.end(), executable) != browsers.end();
+}
+
+bool is_chatgpt_window(HWND window) {
+    if (!window || !is_browser_window(window)) return false;
+    const int length = GetWindowTextLengthW(window);
+    if (length <= 0 || length > 4096) return false;
+    std::wstring title(static_cast<std::size_t>(length) + 1, L'\0');
+    const int copied = GetWindowTextW(window, title.data(), length + 1);
+    if (copied <= 0) return false;
+    title.resize(static_cast<std::size_t>(copied));
+    std::transform(title.begin(), title.end(), title.begin(),
+                   [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
+    return title.find(L"chatgpt") != std::wstring::npos;
 }
 
 BrowserWindowSummary browser_window_summary() {
@@ -139,6 +154,67 @@ int integer_arg(const nlohmann::json& args, const char* name, int min, int max) 
 
 void require_cancelled(const std::function<bool()>& cancelled) {
     if (cancelled && cancelled()) throw std::runtime_error("cancelled");
+}
+
+[[noreturn]] void invalid_capability_request() {
+    throw std::runtime_error("invalid capability request");
+}
+
+void validate_object_keys(const nlohmann::json& args,
+                          std::initializer_list<std::string_view> allowed,
+                          std::initializer_list<std::string_view> required = {}) {
+    if (!args.is_object()) invalid_capability_request();
+    for (const auto key : required)
+        if (!args.contains(std::string(key))) invalid_capability_request();
+    for (auto it = args.begin(); it != args.end(); ++it) {
+        const auto key = std::string_view(it.key());
+        if (std::find(allowed.begin(), allowed.end(), key) == allowed.end()) invalid_capability_request();
+    }
+}
+
+void validate_string_argument(const nlohmann::json& args, const char* key, std::size_t max_bytes,
+                              bool required = false) {
+    if (!args.contains(key)) {
+        if (required) invalid_capability_request();
+        return;
+    }
+    if (!args.at(key).is_string() || args.at(key).get_ref<const std::string&>().empty() ||
+        args.at(key).get_ref<const std::string&>().size() > max_bytes) invalid_capability_request();
+}
+
+void validate_chat_orchestrator_arguments(const std::string& capability, const nlohmann::json& args) {
+    if (capability == "browser.status" || capability == "window.list") {
+        validate_object_keys(args, {});
+    } else if (capability == "window.focus") {
+        validate_object_keys(args, {"window_id"}, {"window_id"});
+        validate_string_argument(args, "window_id", 128, true);
+    } else if (capability == "ui.inspect") {
+        validate_object_keys(args, {"window_id"}, {"window_id"});
+        validate_string_argument(args, "window_id", 128, true);
+    } else if (capability == "ui.focus") {
+        validate_object_keys(args, {"window_id", "target"}, {"window_id", "target"});
+        validate_string_argument(args, "window_id", 128, true);
+        validate_string_argument(args, "target", 512, true);
+    } else if (capability == "ui.invoke") {
+        validate_object_keys(args, {"window_id", "target", "action", "value"}, {"window_id", "target", "action"});
+        validate_string_argument(args, "window_id", 128, true);
+        validate_string_argument(args, "target", 512, true);
+        validate_string_argument(args, "value", 4096);
+        if (!args.at("action").is_string() ||
+            (args.at("action") != "invoke" && args.at("action") != "set_value")) invalid_capability_request();
+        const auto action = args.at("action").get<std::string>();
+        if ((action == "set_value") != args.contains("value")) invalid_capability_request();
+    } else if (capability == "keyboard.type") {
+        validate_object_keys(args, {"text"}, {"text"});
+        if (!args.at("text").is_string() || args.at("text").get_ref<const std::string&>().size() > 1024)
+            invalid_capability_request();
+    } else if (capability == "keyboard.key") {
+        validate_object_keys(args, {"key"}, {"key"});
+        validate_string_argument(args, "key", 16, true);
+        static const std::set<std::string> core_key_allowlist{
+            "ENTER", "ESC", "TAB", "SPACE", "BACKSPACE", "DELETE", "UP", "DOWN", "LEFT", "RIGHT", "HOME", "END"};
+        if (!core_key_allowlist.contains(args.at("key").get<std::string>())) invalid_capability_request();
+    }
 }
 
 std::string base64(const BYTE* data, DWORD size) {
@@ -240,11 +316,19 @@ private:
     bool active_{false};
 };
 
-std::string bstr_utf8(BSTR value) {
-    if (!value) return {};
-    const auto result = narrow(std::wstring_view(value, SysStringLen(value)));
-    SysFreeString(value);
-    return result;
+std::pair<std::string, bool> bounded_bstr_utf8(BSTR value, std::size_t max_chars) {
+    if (!value) return {"", false};
+    const auto length = static_cast<std::size_t>(SysStringLen(value));
+    auto keep = std::min(length, max_chars);
+    if (keep > 0 && keep < length && value[keep - 1] >= 0xd800 && value[keep - 1] <= 0xdbff) --keep;
+    try {
+        auto result = narrow(std::wstring_view(value, keep));
+        SysFreeString(value);
+        return {std::move(result), length > keep};
+    } catch (...) {
+        SysFreeString(value);
+        throw;
+    }
 }
 
 HWND window_handle(const nlohmann::json& args) {
@@ -261,8 +345,10 @@ HWND window_handle(const nlohmann::json& args) {
 nlohmann::json inspect_ui(const nlohmann::json& args, const std::function<bool()>& cancelled) {
     ComApartment apartment;
     const auto window = window_handle(args);
-    const int max_nodes = args.contains("max_nodes") ? integer_arg(args, "max_nodes", 1, 256) : 128;
-    const int max_depth = args.contains("max_depth") ? integer_arg(args, "max_depth", 1, 8) : 4;
+    if (!is_chatgpt_window(window) || GetForegroundWindow() != window)
+        throw std::runtime_error("window is not the foreground ChatGPT browser window");
+    constexpr int max_nodes = 32;
+    constexpr int max_depth = 8;
     ComPtr<IUIAutomation> automation;
     ComPtr<IUIAutomationElement> root;
     ComPtr<IUIAutomationTreeWalker> walker;
@@ -275,6 +361,7 @@ nlohmann::json inspect_ui(const nlohmann::json& args, const std::function<bool()
     bool truncated = false;
     while (!pending.empty() && elements.size() < static_cast<std::size_t>(max_nodes)) {
         require_cancelled(cancelled);
+        if (GetForegroundWindow() != window) throw std::runtime_error("ChatGPT window lost foreground focus during inspection");
         auto current = std::move(pending.back());
         pending.pop_back();
         BSTR name = nullptr, automation_id = nullptr;
@@ -285,7 +372,11 @@ nlohmann::json inspect_ui(const nlohmann::json& args, const std::function<bool()
         current.element->get_CurrentControlType(&control_type);
         current.element->get_CurrentIsEnabled(&enabled);
         current.element->get_CurrentIsOffscreen(&offscreen);
-        elements.push_back({{"name", bstr_utf8(name)}, {"automation_id", bstr_utf8(automation_id)},
+        const auto [element_name, name_truncated] = bounded_bstr_utf8(name, 256);
+        const auto [element_automation_id, automation_id_truncated] = bounded_bstr_utf8(automation_id, 128);
+        elements.push_back({{"name", element_name}, {"name_truncated", name_truncated},
+                            {"automation_id", element_automation_id},
+                            {"automation_id_truncated", automation_id_truncated},
                             {"control_type", control_type}, {"enabled", enabled != FALSE}, {"offscreen", offscreen != FALSE},
                             {"depth", current.depth}});
         if (current.depth >= max_depth) continue;
@@ -308,33 +399,35 @@ nlohmann::json invoke_ui(const nlohmann::json& args, const std::function<bool()>
     ComApartment apartment;
     require_cancelled(cancelled);
     const auto window = window_handle(args);
-    if ((!args.contains("automation_id") || !args["automation_id"].is_string()) &&
-        (!args.contains("name") || !args["name"].is_string())) throw std::runtime_error("invalid capability request");
+    if (!is_chatgpt_window(window) || GetForegroundWindow() != window)
+        throw std::runtime_error("window is not the foreground ChatGPT browser window");
     ComPtr<IUIAutomation> automation;
     ComPtr<IUIAutomationElement> root;
     if (FAILED(CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&automation))) ||
         FAILED(automation->ElementFromHandle(window, &root))) throw std::runtime_error("Windows automation unavailable");
-    VARIANT value; VariantInit(&value);
-    ComPtr<IUIAutomationCondition> condition;
-    if (args.contains("automation_id")) {
-        const auto id = widen(args["automation_id"].get<std::string>());
-        value.vt = VT_BSTR; value.bstrVal = SysAllocStringLen(id.data(), static_cast<UINT>(id.size()));
-        if (!value.bstrVal || FAILED(automation->CreatePropertyCondition(UIA_AutomationIdPropertyId, value, &condition))) {
-            VariantClear(&value); throw std::runtime_error("Windows automation unavailable");
-        }
-    } else {
-        const auto name = widen(args["name"].get<std::string>());
-        value.vt = VT_BSTR; value.bstrVal = SysAllocStringLen(name.data(), static_cast<UINT>(name.size()));
-        if (!value.bstrVal || FAILED(automation->CreatePropertyCondition(UIA_NamePropertyId, value, &condition))) {
-            VariantClear(&value); throw std::runtime_error("Windows automation unavailable");
-        }
-    }
-    VariantClear(&value);
+    const auto target_name = widen(args.at("target").get<std::string>());
     ComPtr<IUIAutomationElementArray> matches;
-    if (FAILED(root->FindAll(TreeScope_Subtree, condition.Get(), &matches)) || !matches) throw std::runtime_error("Windows automation target not found");
-    int count = 0;
-    matches->get_Length(&count);
+    auto find_matches = [&](PROPERTYID property) {
+        VARIANT value; VariantInit(&value);
+        value.vt = VT_BSTR;
+        value.bstrVal = SysAllocStringLen(target_name.data(), static_cast<UINT>(target_name.size()));
+        ComPtr<IUIAutomationCondition> condition;
+        if (!value.bstrVal || FAILED(automation->CreatePropertyCondition(property, value, &condition))) {
+            VariantClear(&value);
+            throw std::runtime_error("Windows automation unavailable");
+        }
+        VariantClear(&value);
+        matches.Reset();
+        if (FAILED(root->FindAll(TreeScope_Subtree, condition.Get(), &matches)) || !matches)
+            throw std::runtime_error("Windows automation target not found");
+        int found = 0;
+        if (FAILED(matches->get_Length(&found))) throw std::runtime_error("Windows automation target not found");
+        return found;
+    };
+    int count = find_matches(UIA_AutomationIdPropertyId);
+    if (count == 0) count = find_matches(UIA_NamePropertyId);
     if (count != 1) throw std::runtime_error(count == 0 ? "Windows automation target not found" : "Windows automation target is ambiguous");
+    if (GetForegroundWindow() != window) throw std::runtime_error("ChatGPT window lost foreground focus");
     ComPtr<IUIAutomationElement> target;
     if (FAILED(matches->GetElement(0, &target)) || !target) throw std::runtime_error("Windows automation target not found");
     const auto action = args.value("action", std::string("invoke"));
@@ -586,34 +679,29 @@ std::vector<CapabilityDescriptor> WindowsPlatform::capabilities() const {
                         {"count", Json{{"type", "integer"}, {"minimum", 1}, {"maximum", 2}}},
                         {"coordinate_space", Json{{"const", "primary_display_pixels"}}}},
                    {"x", "y", "button", "count", "coordinate_space"}), true, {}},
-        {"keyboard.type", "Type literal text into the focused application", "sensitive_write",
-            schema(Json{{"text", Json{{"type", "string"}, {"maxLength", 8192}}},
-                        {"sensitive", Json{{"type", "boolean"}}}}, {"text"}), true, {}},
-        {"keyboard.key", "Press a named key with optional modifiers", "interaction",
-            schema(Json{{"key", Json{{"type", "string"}, {"maxLength", 32}}},
-                        {"modifiers", Json{{"type", "array"}, {"maxItems", 3}}}}, {"key"}), true, {}},
+        {"keyboard.type", "Type literal text into the focused ChatGPT browser control", "sensitive_write",
+            schema(Json{{"text", Json{{"type", "string"}, {"maxLength", 1024}}}}, {"text"}), true, {}},
+        {"keyboard.key", "Press one supported key in the foreground ChatGPT browser", "interaction",
+            schema(Json{{"key", Json{{"enum", Json{"ENTER", "ESC", "TAB", "SPACE", "BACKSPACE", "DELETE",
+                                                        "UP", "DOWN", "LEFT", "RIGHT", "HOME", "END"}}}}, {"key"}), true, {}},
         {"clipboard.read", "Read plain-text clipboard data", "sensitive_read", schema(Json::object()), true, {}},
         {"clipboard.write", "Replace plain-text clipboard data", "sensitive_write",
             schema(Json{{"text", Json{{"type", "string"}, {"maxLength", 1048576}}}}, {"text"}), true, {}},
         {"browser.status", "Report visible-window count and browser visibility without exposing titles", "sensitive_read",
             schema(Json::object()), true, {}},
-        {"window.list", "List visible top-level windows", "sensitive_read", schema(Json::object()), true, {}},
-        {"window.focus", "Focus a visible top-level window by its local id", "interaction",
+        {"window.list", "List visible ChatGPT browser windows with generic titles", "sensitive_read", schema(Json::object()), true, {}},
+        {"window.focus", "Focus a visible ChatGPT browser window by its local id", "interaction",
             schema(Json{{"window_id", Json{{"type", "string"}, {"maxLength", 128}}}}, {"window_id"}), true, {}},
-        {"ui.focus", "Focus one uniquely matched Windows UI Automation control", "interaction",
+        {"ui.focus", "Focus one UI Automation control by target", "interaction",
             schema(Json{{"window_id", Json{{"type", "string"}, {"maxLength", 128}}},
-                        {"automation_id", Json{{"type", "string"}, {"maxLength", 512}}},
-                        {"name", Json{{"type", "string"}, {"maxLength", 512}}}}, {"window_id"}), true, {}},
-        {"ui.inspect", "Inspect a bounded Windows UI Automation control tree", "sensitive_read",
-            schema(Json{{"window_id", Json{{"type", "string"}, {"maxLength", 128}}},
-                        {"max_nodes", Json{{"type", "integer"}, {"minimum", 1}, {"maximum", 256}}},
-                        {"max_depth", Json{{"type", "integer"}, {"minimum", 1}, {"maximum", 8}}}}, {"window_id"}), true, {}},
+                        {"target", Json{{"type", "string"}, {"maxLength", 512}}}}, {"window_id", "target"}), true, {}},
+        {"ui.inspect", "Inspect a bounded foreground ChatGPT UI Automation control tree", "sensitive_read",
+            schema(Json{{"window_id", Json{{"type", "string"}, {"maxLength", 128}}}}, {"window_id"}), true, {}},
         {"ui.invoke", "Invoke a uniquely matched UI Automation control or set its value", "interaction",
             schema(Json{{"window_id", Json{{"type", "string"}, {"maxLength", 128}}},
-                        {"automation_id", Json{{"type", "string"}, {"maxLength", 512}}},
-                        {"name", Json{{"type", "string"}, {"maxLength", 512}}},
+                        {"target", Json{{"type", "string"}, {"maxLength", 512}}},
                         {"action", Json{{"enum", Json{"invoke", "set_value"}}}},
-                        {"value", Json{{"type", "string"}, {"maxLength", 4096}}}}, {"window_id"}), true, {}},
+                        {"value", Json{{"type", "string"}, {"maxLength", 4096}}}}, {"window_id", "target", "action"}), true, {}},
         {"shell.execute", "Run an allowlisted executable with explicit arguments", "high",
             schema(Json{{"executable", Json{{"type", "string"}, {"maxLength", 4096}}},
                         {"arguments", Json{{"type", "array"}, {"maxItems", 128}}},
@@ -643,6 +731,7 @@ bool WindowsPlatform::available(const std::string& capability) const {
 nlohmann::json WindowsPlatform::invoke(const std::string& capability, const nlohmann::json& args,
                                        const std::function<bool()>& cancelled) {
     require_cancelled(cancelled);
+    validate_chat_orchestrator_arguments(capability, args);
     if (capability == "screen.capture") return capture(cancelled);
     if (capability == "ui.focus") {
         auto focus_args = args;
@@ -677,35 +766,28 @@ nlohmann::json WindowsPlatform::invoke(const std::string& capability, const nloh
         return {{"clicked", true}, {"count", count}};
     }
     if (capability == "keyboard.type") {
-        if (!args.contains("text") || !args["text"].is_string()) throw std::runtime_error("invalid capability request");
+        const HWND target_window = GetForegroundWindow();
+        if (!is_chatgpt_window(target_window)) throw std::runtime_error("foreground window is not ChatGPT");
         const auto& text = args["text"].get_ref<const std::string&>();
-        if (text.size() > 8192) throw std::runtime_error("invalid capability request");
+        if (text.size() > 1024) throw std::runtime_error("keyboard input exceeds the per-call limit");
         const auto wide = widen(text);
         std::vector<INPUT> inputs; inputs.reserve(wide.size() * 2);
         for (wchar_t ch : wide) { INPUT down{}; down.type = INPUT_KEYBOARD; down.ki.wScan = static_cast<WORD>(ch); down.ki.dwFlags = KEYEVENTF_UNICODE; inputs.push_back(down); INPUT up = down; up.ki.dwFlags |= KEYEVENTF_KEYUP; inputs.push_back(up); }
+        if (GetForegroundWindow() != target_window || !is_chatgpt_window(target_window))
+            throw std::runtime_error("foreground ChatGPT window changed before keyboard input");
         if (!send_input(inputs)) throw std::runtime_error("keyboard input failed");
         return {{"typed_chars", wide.size()}, {"sensitive_payload_redacted", true}};
     }
     if (capability == "keyboard.key") {
-        if (!args.contains("key") || !args["key"].is_string()) throw std::runtime_error("invalid capability request");
+        const HWND target_window = GetForegroundWindow();
+        if (!is_chatgpt_window(target_window)) throw std::runtime_error("foreground window is not ChatGPT");
         const auto key = args["key"].get<std::string>();
-        if (key.empty() || key.size() > 32) throw std::runtime_error("invalid capability request");
-        std::vector<WORD> modifiers;
-        if (args.contains("modifiers")) {
-            if (!args["modifiers"].is_array() || args["modifiers"].size() > 3) throw std::runtime_error("invalid capability request");
-            for (const auto& item : args["modifiers"]) {
-                if (!item.is_string()) throw std::runtime_error("invalid capability request");
-                const auto mod = item.get<std::string>();
-                if (mod == "ctrl") modifiers.push_back(VK_CONTROL); else if (mod == "shift") modifiers.push_back(VK_SHIFT);
-                else if (mod == "alt") modifiers.push_back(VK_MENU); else if (mod == "win") modifiers.push_back(VK_LWIN);
-                else throw std::runtime_error("invalid capability request");
-            }
-        }
+        if (key.empty() || key.size() > 16) throw std::runtime_error("invalid capability request");
         const auto vk = key_code(key);
         std::vector<INPUT> inputs;
-        for (auto mod : modifiers) append_key(inputs, mod, 0);
         append_key(inputs, vk, 0); append_key(inputs, vk, KEYEVENTF_KEYUP);
-        for (auto it = modifiers.rbegin(); it != modifiers.rend(); ++it) append_key(inputs, *it, KEYEVENTF_KEYUP);
+        if (GetForegroundWindow() != target_window || !is_chatgpt_window(target_window))
+            throw std::runtime_error("foreground ChatGPT window changed before keyboard input");
         if (!send_input(inputs)) throw std::runtime_error("keyboard input failed");
         return {{"pressed", true}};
     }
@@ -748,16 +830,13 @@ nlohmann::json WindowsPlatform::invoke(const std::string& capability, const nloh
         std::pair<nlohmann::json*, bool*> state{&windows, &truncated};
         EnumWindows([](HWND window, LPARAM data) -> BOOL {
             auto& state = *reinterpret_cast<std::pair<nlohmann::json*, bool*>*>(data);
-            if (!IsWindowVisible(window)) return TRUE;
+            if (!IsWindowVisible(window) || !is_chatgpt_window(window)) return TRUE;
             const int length = GetWindowTextLengthW(window);
-            if (length <= 0) return TRUE;
-            if (state.first->size() >= 512) { *state.second = true; return FALSE; }
-            const int keep = std::min(length, 4096);
-            std::wstring title(static_cast<std::size_t>(keep) + 1, L'\0');
-            const int copied = GetWindowTextW(window, title.data(), keep + 1);
-            title.resize(std::max(0, copied));
+            if (length <= 0 || length > 4096) return TRUE;
+            if (state.first->size() >= 32) { *state.second = true; return FALSE; }
             wchar_t id[32]{}; swprintf_s(id, L"%p", static_cast<void*>(window));
-            state.first->push_back({{"window_id", narrow(id)}, {"title", narrow(title)}, {"title_truncated", length > keep}});
+            state.first->push_back({{"window_id", narrow(id)}, {"title", "ChatGPT"},
+                                    {"active", GetForegroundWindow() == window}});
             return TRUE;
         }, reinterpret_cast<LPARAM>(&state));
         return {{"windows", windows}, {"windows_truncated", truncated}};
@@ -768,7 +847,7 @@ nlohmann::json WindowsPlatform::invoke(const std::string& capability, const nloh
         wchar_t* end = nullptr; const auto value = wcstoull(text.c_str(), &end, 16);
         if (!end || *end != L'\0' || value == 0) throw std::runtime_error("invalid capability request");
         HWND hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(value));
-        if (!IsWindow(hwnd) || !SetForegroundWindow(hwnd)) throw std::runtime_error("window focus failed");
+        if (!IsWindow(hwnd) || !is_chatgpt_window(hwnd) || !SetForegroundWindow(hwnd)) throw std::runtime_error("window focus failed");
         return {{"focused", true}};
     }
     if (capability == "shell.execute") return run_process(config_, args, cancelled);
