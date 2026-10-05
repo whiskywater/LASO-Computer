@@ -527,7 +527,9 @@ nlohmann::json invoke_ui(const nlohmann::json& args, const std::function<bool()>
         if (FAILED(target->GetCurrentPatternAs(UIA_InvokePatternId, IID_PPV_ARGS(&pattern))) || !pattern)
             throw std::runtime_error("Windows control does not support activation");
         if (GetForegroundWindow() != window) throw std::runtime_error("ChatGPT window lost foreground focus");
-        if (FAILED(pattern->Invoke())) throw std::runtime_error("Windows control invocation failed");
+        const HRESULT invoke_result = pattern->Invoke();
+        if (FAILED(invoke_result))
+            throw std::runtime_error("Windows control invocation failed HRESULT=" + std::to_string(static_cast<long>(invoke_result)));
     } else if (action == "double_click") {
         BOOL enabled = FALSE;
         BOOL offscreen = TRUE;

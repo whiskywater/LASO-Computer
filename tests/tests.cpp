@@ -148,6 +148,8 @@ void failed_job_semantics_test() {
     }
     require(result.value("ok", false), "a failed capability action must not become a transport failure");
     require(result.value("state", std::string{}) == "Failed", "failed capability action should report Failed state");
+    require(result.value("error", std::string{}) == "expected action failure",
+            "failed capability action should preserve bounded provider diagnostics");
 }
 
 void cancellation_test() {

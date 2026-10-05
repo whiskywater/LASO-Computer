@@ -319,7 +319,7 @@ nlohmann::json WorkerProtocol::submit(const nlohmann::json& request) {
                 } else if (std::string(error.what()) == "capability unavailable") {
                     job->state = "Failed"; job->error = "capability unavailable"; outcome = "failed";
                 } else {
-                    job->state = "Failed"; job->error = "capability failed"; outcome = "failed";
+                    job->state = "Failed"; job->error = std::string(error.what()).substr(0, 512); outcome = "failed";
                 }
             }
             job->approval_changed.notify_all();
