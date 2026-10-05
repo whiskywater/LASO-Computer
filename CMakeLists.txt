@@ -74,8 +74,12 @@ if(BUILD_TESTING)
   target_link_libraries(laso-broker-tests PRIVATE laso_broker_core)
   target_compile_options(laso-broker-tests PRIVATE /W4 /permissive- /EHsc /utf-8)
   add_test(NAME laso-broker-tests COMMAND laso-broker-tests)
+  # Desktop UIA tests use a separate runtime library so the local file:// fixture
+  # exception is never compiled into the shipping laso_core or worker artifact.
+  add_laso_computer_core(laso_core_desktop_tests)
+  target_compile_definitions(laso_core_desktop_tests PRIVATE LASO_UIA_TEST_FIXTURE)
   add_executable(laso-desktop-tests tests/desktop_tests.cpp)
-  target_link_libraries(laso-desktop-tests PRIVATE laso_core Ole32 User32)
+  target_link_libraries(laso-desktop-tests PRIVATE laso_core_desktop_tests Ole32 User32)
   target_compile_options(laso-desktop-tests PRIVATE /W4 /permissive- /EHsc /utf-8)
   # Manual Windows experiment; it launches Node under a token with all
   # optional privileges disabled and reports actual file/process access.

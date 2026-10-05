@@ -75,15 +75,54 @@ bool is_browser_window(HWND window) {
 
 bool is_chatgpt_window(HWND window) {
     if (!window || !is_browser_window(window)) return false;
-    const int length = GetWindowTextLengthW(window);
-    if (length <= 0 || length > 4096) return false;
-    std::wstring title(static_cast<std::size_t>(length) + 1, L'\0');
-    const int copied = GetWindowTextW(window, title.data(), length + 1);
-    if (copied <= 0) return false;
-    title.resize(static_cast<std::size_t>(copied));
-    std::transform(title.begin(), title.end(), title.begin(),
-                   [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
-    return title.find(L"chatgpt") != std::wstring::npos;
+
+    const HRESULT initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(initialized) && initialized != RPC_E_CHANGED_MODE) return false;
+    const bool should_uninitialize = SUCCEEDED(initialized);
+    bool matched = false;
+
+    {
+        ComPtr<IUIAutomation> automation;
+        ComPtr<IUIAutomationElement> root;
+        if (SUCCEEDED(CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&automation))) &&
+            automation && SUCCEEDED(automation->ElementFromHandle(window, &root)) && root) {
+            VARIANT document_type;
+            VariantInit(&document_type);
+            document_type.vt = VT_I4;
+            document_type.lVal = UIA_DocumentControlTypeId;
+            ComPtr<IUIAutomationCondition> condition;
+            ComPtr<IUIAutomationElement> document;
+            if (SUCCEEDED(automation->CreatePropertyCondition(UIA_ControlTypePropertyId, document_type, &condition)) &&
+                condition && SUCCEEDED(root->FindFirst(TreeScope_Subtree, condition.Get(), &document)) && document) {
+                ComPtr<IUIAutomationValuePattern> value_pattern;
+                if (SUCCEEDED(document->GetCurrentPatternAs(UIA_ValuePatternId, IID_PPV_ARGS(&value_pattern))) &&
+                    value_pattern) {
+                    BSTR raw_url = nullptr;
+                    if (SUCCEEDED(value_pattern->get_CurrentValue(&raw_url)) && raw_url) {
+                        std::wstring url(raw_url, SysStringLen(raw_url));
+                        SysFreeString(raw_url);
+                        std::transform(url.begin(), url.end(), url.begin(),
+                                       [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
+                        matched = url == L"https://chatgpt.com" || url.rfind(L"https://chatgpt.com/", 0) == 0;
+#ifdef LASO_UIA_TEST_FIXTURE
+                        if (!matched && url.rfind(L"file:///", 0) == 0) {
+                            BSTR raw_name = nullptr;
+                            if (SUCCEEDED(document->get_CurrentName(&raw_name)) && raw_name) {
+                                const std::wstring name(raw_name, SysStringLen(raw_name));
+                                SysFreeString(raw_name);
+                                matched = name == L"ChatGPT - LASO Lane 4 UIA Fixture";
+                            }
+                        }
+#endif
+                    }
+                }
+            }
+            VariantClear(&document_type);
+        }
+    }
+
+    if (should_uninitialize) CoUninitialize();
+    return matched;
 }
 
 BrowserWindowSummary browser_window_summary() {
