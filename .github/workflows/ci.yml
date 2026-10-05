@@ -1,0 +1,39 @@
+name: Windows C++ CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        configuration: [Debug, Release]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Configure
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DBUILD_TESTING=ON -DLASO_BUILD_ACCEPTANCE_WORKER=ON
+      - name: Build
+        run: cmake --build build --config ${{ matrix.configuration }} --parallel
+      - name: Unit and protocol tests
+        run: ctest --test-dir build -C ${{ matrix.configuration }} --output-on-failure
+      - name: Upload worker for acceptance
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: laso-computer-${{ matrix.configuration }}-${{ github.sha }}
+          path: |
+            build/${{ matrix.configuration }}/laso-computer.exe
+            build/${{ matrix.configuration }}/laso-computer-acceptance.exe
+            build/${{ matrix.configuration }}/laso-desktop-tests.exe
+          if-no-files-found: error
+          retention-days: 1

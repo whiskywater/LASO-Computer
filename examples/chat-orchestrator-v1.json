@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "default_decision": "deny",
+  "capabilities": {
+    "browser.status": "allow",
+    "window.list": "allow",
+    "ui.inspect": "require_approval",
+    "window.focus": "require_approval",
+    "ui.focus": "require_approval",
+    "ui.invoke": "require_approval",
+    "keyboard.type": "require_approval",
+    "keyboard.key": "require_approval"
+  },
+  "shell": {
+    "allowed_executables": [],
+    "environment_allowlist": []
+  },
+  "plugins": {
+    "playwright": {
+      "enabled": false,
+      "node_executable": "",
+      "server_entry": "",
+      "browser_executable": ""
+    }
+  },
+  "approval_timeout_ms": 60000
+}

@@ -1,0 +1,8 @@
+{
+  "scripts": {
+    "postinstall": "node ./patch-appcontainer-pipes.cjs"
+  },
+  "dependencies": {
+    "@playwright/mcp": "0.0.83"
+  }
+}
