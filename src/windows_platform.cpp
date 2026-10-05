@@ -187,26 +187,25 @@ void validate_chat_orchestrator_arguments(const std::string& capability, const n
         validate_object_keys(args, {});
     } else if (capability == "window.focus") {
         validate_object_keys(args, {"window_id"}, {"window_id"});
-        validate_string_argument(args, "window_id", 128, true);
+        validate_string_argument(args, "window_id", 256, true);
     } else if (capability == "ui.inspect") {
-        validate_object_keys(args, {"window_id"}, {"window_id"});
-        validate_string_argument(args, "window_id", 128, true);
+        validate_object_keys(args, {"window_id"});
+        validate_string_argument(args, "window_id", 256);
     } else if (capability == "ui.focus") {
         validate_object_keys(args, {"window_id", "target"}, {"window_id", "target"});
-        validate_string_argument(args, "window_id", 128, true);
+        validate_string_argument(args, "window_id", 256, true);
         validate_string_argument(args, "target", 512, true);
     } else if (capability == "ui.invoke") {
-        validate_object_keys(args, {"window_id", "target", "action", "value"}, {"window_id", "target", "action"});
-        validate_string_argument(args, "window_id", 128, true);
+        validate_object_keys(args, {"window_id", "target", "action"}, {"window_id", "target", "action"});
+        validate_string_argument(args, "window_id", 256, true);
         validate_string_argument(args, "target", 512, true);
-        validate_string_argument(args, "value", 4096);
-        if (!args.at("action").is_string() ||
-            (args.at("action") != "invoke" && args.at("action") != "set_value")) invalid_capability_request();
-        const auto action = args.at("action").get<std::string>();
-        if ((action == "set_value") != args.contains("value")) invalid_capability_request();
+        validate_string_argument(args, "action", 32, true);
+        static const std::set<std::string> core_actions{"click", "double_click", "submit"};
+        if (!core_actions.contains(args.at("action").get<std::string>())) invalid_capability_request();
     } else if (capability == "keyboard.type") {
         validate_object_keys(args, {"text"}, {"text"});
-        if (!args.at("text").is_string() || args.at("text").get_ref<const std::string&>().size() > 1024)
+        if (!args.at("text").is_string() || args.at("text").get_ref<const std::string&>().empty() ||
+            args.at("text").get_ref<const std::string&>().size() > 4096)
             invalid_capability_request();
     } else if (capability == "keyboard.key") {
         validate_object_keys(args, {"key"}, {"key"});
@@ -331,8 +330,12 @@ std::pair<std::string, bool> bounded_bstr_utf8(BSTR value, std::size_t max_chars
     }
 }
 
-HWND window_handle(const nlohmann::json& args) {
-    if (!args.contains("window_id") || !args["window_id"].is_string()) throw std::runtime_error("invalid capability request");
+HWND window_handle(const nlohmann::json& args, bool use_foreground_when_missing = false) {
+    if (!args.contains("window_id")) {
+        if (use_foreground_when_missing) return GetForegroundWindow();
+        throw std::runtime_error("invalid capability request");
+    }
+    if (!args["window_id"].is_string()) throw std::runtime_error("invalid capability request");
     const auto text = widen(args["window_id"].get<std::string>());
     wchar_t* end = nullptr;
     const auto value = wcstoull(text.c_str(), &end, 16);
@@ -344,7 +347,7 @@ HWND window_handle(const nlohmann::json& args) {
 
 nlohmann::json inspect_ui(const nlohmann::json& args, const std::function<bool()>& cancelled) {
     ComApartment apartment;
-    const auto window = window_handle(args);
+    const auto window = window_handle(args, true);
     if (!is_chatgpt_window(window) || GetForegroundWindow() != window)
         throw std::runtime_error("window is not the foreground ChatGPT browser window");
     constexpr int max_nodes = 32;
@@ -430,26 +433,78 @@ nlohmann::json invoke_ui(const nlohmann::json& args, const std::function<bool()>
     if (GetForegroundWindow() != window) throw std::runtime_error("ChatGPT window lost foreground focus");
     ComPtr<IUIAutomationElement> target;
     if (FAILED(matches->GetElement(0, &target)) || !target) throw std::runtime_error("Windows automation target not found");
-    const auto action = args.value("action", std::string("invoke"));
+    const auto action = args.at("action").get<std::string>();
+    require_cancelled(cancelled);
+    if (GetForegroundWindow() != window) throw std::runtime_error("ChatGPT window lost foreground focus");
     if (action == "focus") {
         if (FAILED(target->SetFocus())) throw std::runtime_error("Windows control focus failed");
-    } else if (action == "set_value") {
-        if (!args.contains("value") || !args["value"].is_string() || args["value"].get_ref<const std::string&>().size() > 4096)
-            throw std::runtime_error("invalid capability request");
-        ComPtr<IUIAutomationValuePattern> pattern;
-        if (FAILED(target->GetCurrentPatternAs(UIA_ValuePatternId, IID_PPV_ARGS(&pattern))) || !pattern)
-            throw std::runtime_error("Windows control does not support setting a value");
-        const auto text = widen(args["value"].get<std::string>());
-        BSTR bstr = SysAllocStringLen(text.data(), static_cast<UINT>(text.size()));
-        if (!bstr) throw std::runtime_error("Windows control value update failed");
-        const auto set_result = pattern->SetValue(bstr);
-        SysFreeString(bstr);
-        if (FAILED(set_result)) throw std::runtime_error("Windows control value update failed");
-    } else if (action == "invoke") {
+    } else if (action == "click" || action == "submit") {
         ComPtr<IUIAutomationInvokePattern> pattern;
         if (FAILED(target->GetCurrentPatternAs(UIA_InvokePatternId, IID_PPV_ARGS(&pattern))) || !pattern)
-            throw std::runtime_error("Windows control does not support invoke");
+            throw std::runtime_error("Windows control does not support activation");
+        if (GetForegroundWindow() != window) throw std::runtime_error("ChatGPT window lost foreground focus");
         if (FAILED(pattern->Invoke())) throw std::runtime_error("Windows control invocation failed");
+    } else if (action == "double_click") {
+        BOOL enabled = FALSE;
+        BOOL offscreen = TRUE;
+        RECT element_bounds{};
+        RECT window_bounds{};
+        if (FAILED(target->get_CurrentIsEnabled(&enabled)) || !enabled ||
+            FAILED(target->get_CurrentIsOffscreen(&offscreen)) || offscreen ||
+            FAILED(target->get_CurrentBoundingRectangle(&element_bounds)) || !GetWindowRect(window, &window_bounds))
+            throw std::runtime_error("UI Automation target has no safe on-screen rectangle");
+        if (element_bounds.right <= element_bounds.left || element_bounds.bottom <= element_bounds.top ||
+            element_bounds.left < window_bounds.left || element_bounds.top < window_bounds.top ||
+            element_bounds.right > window_bounds.right || element_bounds.bottom > window_bounds.bottom)
+            throw std::runtime_error("UI Automation target rectangle is outside the ChatGPT window");
+        const auto center_x = static_cast<std::int64_t>(element_bounds.left) +
+                              (static_cast<std::int64_t>(element_bounds.right) - element_bounds.left) / 2;
+        const auto center_y = static_cast<std::int64_t>(element_bounds.top) +
+                              (static_cast<std::int64_t>(element_bounds.bottom) - element_bounds.top) / 2;
+        const auto virtual_left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        const auto virtual_top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        const auto virtual_width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        const auto virtual_height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        const auto virtual_right = static_cast<std::int64_t>(virtual_left) + virtual_width;
+        const auto virtual_bottom = static_cast<std::int64_t>(virtual_top) + virtual_height;
+        if (virtual_width <= 0 || virtual_height <= 0 ||
+            element_bounds.left < virtual_left || element_bounds.top < virtual_top ||
+            element_bounds.right > virtual_right || element_bounds.bottom > virtual_bottom ||
+            center_x < virtual_left || center_y < virtual_top || center_x >= virtual_right || center_y >= virtual_bottom)
+            throw std::runtime_error("UI Automation target rectangle is outside the desktop bounds");
+        const auto x = static_cast<int>(center_x);
+        const auto y = static_cast<int>(center_y);
+        require_cancelled(cancelled);
+        if (GetForegroundWindow() != window || !is_chatgpt_window(window))
+            throw std::runtime_error("ChatGPT window lost foreground focus before double-click");
+        if (!SetCursorPos(x, y)) throw std::runtime_error("UI Automation target could not be reached");
+        BOOL current_enabled = FALSE;
+        BOOL current_offscreen = TRUE;
+        RECT current_bounds{};
+        if (FAILED(target->get_CurrentIsEnabled(&current_enabled)) || !current_enabled ||
+            FAILED(target->get_CurrentIsOffscreen(&current_offscreen)) || current_offscreen ||
+            FAILED(target->get_CurrentBoundingRectangle(&current_bounds)) ||
+            current_bounds.left != element_bounds.left || current_bounds.top != element_bounds.top ||
+            current_bounds.right != element_bounds.right || current_bounds.bottom != element_bounds.bottom)
+            throw std::runtime_error("UI Automation target changed before double-click");
+        POINT cursor{};
+        if (!GetCursorPos(&cursor) || cursor.x != x || cursor.y != y)
+            throw std::runtime_error("UI Automation target center could not be verified");
+        require_cancelled(cancelled);
+        if (GetForegroundWindow() != window || !is_chatgpt_window(window))
+            throw std::runtime_error("ChatGPT window lost foreground focus before double-click");
+        INPUT inputs[4]{};
+        for (std::size_t i = 0; i < 4; ++i) {
+            inputs[i].type = INPUT_MOUSE;
+            inputs[i].mi.dwFlags = (i % 2 == 0) ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP;
+        }
+        if (SendInput(4, inputs, sizeof(INPUT)) != 4) {
+            INPUT release{};
+            release.type = INPUT_MOUSE;
+            release.mi.dwFlags = MOUSEEVENTF_LEFTUP;
+            SendInput(1, &release, sizeof(INPUT));
+            throw std::runtime_error("bounded UI Automation double-click failed");
+        }
     } else throw std::runtime_error("invalid capability request");
     return {{"performed", action}};
 }
@@ -680,7 +735,7 @@ std::vector<CapabilityDescriptor> WindowsPlatform::capabilities() const {
                         {"coordinate_space", Json{{"const", "primary_display_pixels"}}}},
                    {"x", "y", "button", "count", "coordinate_space"}), true, {}},
         {"keyboard.type", "Type literal text into the focused ChatGPT browser control", "sensitive_write",
-            schema(Json{{"text", Json{{"type", "string"}, {"maxLength", 1024}}}}, {"text"}), true, {}},
+            schema(Json{{"text", Json{{"type", "string"}, {"minLength", 1}, {"maxLength", 4096}}}}, {"text"}), true, {}},
         {"keyboard.key", "Press one supported key in the foreground ChatGPT browser", "interaction",
             schema(Json{{"key", Json{{"enum", Json{"ENTER", "ESC", "TAB", "SPACE", "BACKSPACE", "DELETE",
                                                         "UP", "DOWN", "LEFT", "RIGHT", "HOME", "END"}}}}}, {"key"}), true, {}},
@@ -691,17 +746,17 @@ std::vector<CapabilityDescriptor> WindowsPlatform::capabilities() const {
             schema(Json::object()), true, {}},
         {"window.list", "List visible ChatGPT browser windows with generic titles", "sensitive_read", schema(Json::object()), true, {}},
         {"window.focus", "Focus a visible ChatGPT browser window by its local id", "interaction",
-            schema(Json{{"window_id", Json{{"type", "string"}, {"maxLength", 128}}}}, {"window_id"}), true, {}},
+            schema(Json{{"window_id", Json{{"type", "string"}, {"minLength", 1}, {"maxLength", 256}}}}, {"window_id"}), true, {}},
         {"ui.focus", "Focus one UI Automation control by target", "interaction",
-            schema(Json{{"window_id", Json{{"type", "string"}, {"maxLength", 128}}},
-                        {"target", Json{{"type", "string"}, {"maxLength", 512}}}}, {"window_id", "target"}), true, {}},
+            schema(Json{{"window_id", Json{{"type", "string"}, {"minLength", 1}, {"maxLength", 256}}},
+                        {"target", Json{{"type", "string"}, {"minLength", 1}, {"maxLength", 512}}}}, {"window_id", "target"}), true, {}},
         {"ui.inspect", "Inspect a bounded foreground ChatGPT UI Automation control tree", "sensitive_read",
-            schema(Json{{"window_id", Json{{"type", "string"}, {"maxLength", 128}}}}, {"window_id"}), true, {}},
-        {"ui.invoke", "Invoke a uniquely matched UI Automation control or set its value", "interaction",
-            schema(Json{{"window_id", Json{{"type", "string"}, {"maxLength", 128}}},
-                        {"target", Json{{"type", "string"}, {"maxLength", 512}}},
-                        {"action", Json{{"enum", Json{"invoke", "set_value"}}}},
-                        {"value", Json{{"type", "string"}, {"maxLength", 4096}}}}, {"window_id", "target", "action"}), true, {}},
+            schema(Json{{"window_id", Json{{"type", "string"}, {"minLength", 1}, {"maxLength", 256}}}}), true, {}},
+        {"ui.invoke", "Activate a uniquely matched UI Automation control", "interaction",
+            schema(Json{{"window_id", Json{{"type", "string"}, {"minLength", 1}, {"maxLength", 256}}},
+                        {"target", Json{{"type", "string"}, {"minLength", 1}, {"maxLength", 512}}},
+                        {"action", Json{{"enum", Json::array({"click", "double_click", "submit"})}}}},
+                   {"window_id", "target", "action"}), true, {}},
         {"shell.execute", "Run an allowlisted executable with explicit arguments", "high",
             schema(Json{{"executable", Json{{"type", "string"}, {"maxLength", 4096}}},
                         {"arguments", Json{{"type", "array"}, {"maxItems", 128}}},
@@ -769,7 +824,7 @@ nlohmann::json WindowsPlatform::invoke(const std::string& capability, const nloh
         const HWND target_window = GetForegroundWindow();
         if (!is_chatgpt_window(target_window)) throw std::runtime_error("foreground window is not ChatGPT");
         const auto& text = args["text"].get_ref<const std::string&>();
-        if (text.size() > 1024) throw std::runtime_error("keyboard input exceeds the per-call limit");
+        if (text.empty() || text.size() > 4096) throw std::runtime_error("invalid capability request");
         const auto wide = widen(text);
         std::vector<INPUT> inputs; inputs.reserve(wide.size() * 2);
         for (wchar_t ch : wide) { INPUT down{}; down.type = INPUT_KEYBOARD; down.ki.wScan = static_cast<WORD>(ch); down.ki.dwFlags = KEYEVENTF_UNICODE; inputs.push_back(down); INPUT up = down; up.ki.dwFlags |= KEYEVENTF_KEYUP; inputs.push_back(up); }

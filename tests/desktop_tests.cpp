@@ -166,14 +166,19 @@ public:
         const auto page = directory_ / L"fixture.html";
         std::ofstream html(page, std::ios::binary);
         html << "<!doctype html><html><head><meta charset='utf-8'><title>ChatGPT - LASO Lane 4 UIA Fixture</title></head>"
-                "<body><label for='chat'>Message</label>"
+                "<body><form id='chat-form'><label for='chat'>Message</label>"
                 "<textarea id='chat' aria-label='Lane 4 fixture message'></textarea>"
                 "<button id='send' aria-label='Send fixture'>Send fixture</button>"
+                "<button id='submit' type='submit' aria-label='Submit fixture'>Submit fixture</button></form>"
+                "<button id='disabled' disabled aria-label='Disabled fixture'>Disabled fixture</button>"
                 "<div id='status' aria-live='polite'>LANE4-READY</div>"
                 "<script>const c=document.getElementById('chat');const s=document.getElementById('status');"
                 "c.addEventListener('input',()=>s.textContent=c.value);"
                 "c.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();s.textContent='LANE4-KEY-DISPATCH-OK';}});"
-                "document.getElementById('send').addEventListener('click',()=>s.textContent='LANE4-INVOKE-OK');</script>"
+                "const send=document.getElementById('send');"
+                "send.addEventListener('click',()=>s.textContent='LANE4-CLICK-OK');"
+                "send.addEventListener('dblclick',()=>s.textContent='LANE4-DOUBLE-CLICK-OK');"
+                "document.getElementById('chat-form').addEventListener('submit',e=>{e.preventDefault();s.textContent='LANE4-SUBMIT-OK';});</script>"
                 "</body></html>";
         html.close();
         require(static_cast<bool>(html), "could not create the disposable browser fixture page");
@@ -341,8 +346,7 @@ void run_tests() {
     UpdateWindow(window);
     pump_messages();
     BrowserFixture browser_fixture;
-    if (!browser_fixture.ready())
-        std::cout << "Browser UI Automation fixture skipped: Edge or Chrome was not found\n";
+    require(browser_fixture.ready(), "Edge or Chrome is required for the browser UI Automation fixture");
 
     POINT original_cursor{};
     GetCursorPos(&original_cursor);
@@ -362,8 +366,42 @@ void run_tests() {
     for (const auto* capability : {"screen.capture", "pointer.move", "pointer.click", "keyboard.type",
             "clipboard.read", "clipboard.write", "browser.status", "window.list", "window.focus", "ui.focus", "ui.inspect", "ui.invoke"})
         config.capabilities[capability] = laso::Decision::allow;
+    auto platform = std::make_shared<laso::WindowsPlatform>(config);
+    const auto descriptors = platform->capabilities();
+    const auto descriptor = [&](const std::string& name) -> const laso::CapabilityDescriptor& {
+        const auto it = std::find_if(descriptors.begin(), descriptors.end(), [&](const auto& item) { return item.name == name; });
+        require(it != descriptors.end(), "missing capability descriptor");
+        return *it;
+    };
+    require(descriptor("browser.status").argument_schema.at("properties").empty() &&
+                descriptor("window.list").argument_schema.at("properties").empty(),
+            "browser.status and window.list must accept only empty argument objects");
+    require(descriptor("window.focus").argument_schema.at("properties").at("window_id").at("maxLength") == 256 &&
+                descriptor("window.focus").argument_schema.at("required") == nlohmann::json::array({"window_id"}),
+            "window.focus descriptor must match Core's required 256-byte identifier contract");
+    require(descriptor("ui.inspect").argument_schema.at("properties").at("window_id").at("maxLength") == 256 &&
+                !descriptor("ui.inspect").argument_schema.contains("required"),
+            "ui.inspect descriptor must make its bounded window_id optional");
+    require(descriptor("ui.focus").argument_schema.at("properties").at("window_id").at("maxLength") == 256 &&
+                descriptor("ui.focus").argument_schema.at("properties").at("target").at("maxLength") == 512 &&
+                descriptor("ui.focus").argument_schema.at("required") == nlohmann::json::array({"window_id", "target"}),
+            "ui.focus descriptor must match Core's bounded required fields");
+    const auto invoke_schema = descriptor("ui.invoke").argument_schema;
+    require(invoke_schema.at("properties").size() == 3 &&
+                invoke_schema.at("properties").at("window_id").at("maxLength") == 256 &&
+                invoke_schema.at("properties").at("target").at("maxLength") == 512 &&
+                invoke_schema.at("properties").at("action").at("enum") ==
+                    nlohmann::json::array({"click", "double_click", "submit"}) &&
+                invoke_schema.at("required") == nlohmann::json::array({"window_id", "target", "action"}),
+            "ui.invoke descriptor must expose only Core's canonical action contract");
+    require(descriptor("keyboard.type").argument_schema.at("properties").at("text").at("minLength") == 1 &&
+                descriptor("keyboard.type").argument_schema.at("properties").at("text").at("maxLength") == 4096 &&
+                descriptor("keyboard.key").argument_schema.at("properties").at("key").at("enum") ==
+                    nlohmann::json::array({"ENTER", "ESC", "TAB", "SPACE", "BACKSPACE", "DELETE", "UP", "DOWN",
+                                           "LEFT", "RIGHT", "HOME", "END"}),
+            "keyboard descriptors must match Core's non-empty text and key contracts");
     laso::CapabilityRegistry registry;
-    registry.register_provider(std::make_shared<laso::WindowsPlatform>(config));
+    registry.register_provider(platform);
     const auto audit_path = std::filesystem::temp_directory_path() / L"laso-desktop-test-audit.jsonl";
     std::error_code ignored; std::filesystem::remove(audit_path, ignored);
     laso::WorkerProtocol worker(config, std::move(registry), laso::AuditLog(audit_path));
@@ -375,7 +413,7 @@ void run_tests() {
     bool found = false;
     for (const auto& item : list.at("windows")) if (item.value("window_id", "") == window_id) found = true;
     require(!found, "browser discovery must not expose unrelated non-browser windows");
-    if (browser_fixture.ready()) {
+    {
         const auto browser_id = handle_id(browser_fixture.window());
         bool browser_found = false;
         auto current_windows = list.at("windows");
@@ -417,7 +455,7 @@ void run_tests() {
     require(unrelated_control_focus.value("state", std::string{}) == "Failed",
             "UI Automation focus must not target a non-ChatGPT window");
     const auto unrelated_control_invoke = run_core_job(core_worker, "ui.invoke",
-        {{"window_id", window_id}, {"target", std::to_string(button_id)}, {"action", "invoke"}},
+        {{"window_id", window_id}, {"target", std::to_string(button_id)}, {"action", "click"}},
         "ui-invoke-unrelated-window");
     require(unrelated_control_invoke.value("state", std::string{}) == "Failed",
             "UI Automation invoke must not target a non-ChatGPT window");
@@ -426,41 +464,64 @@ void run_tests() {
         {{"window_id", window_id}, {"max_nodes", 65}}, "ui-inspect-oversized-limit");
     require(malformed_inspect.value("state", std::string{}) == "Failed",
             "UI Automation must reject arguments outside its fixed bounded inspection schema");
+    const auto malformed_inspect_window_id = run_core_job(core_worker, "ui.inspect",
+        {{"window_id", std::string(257, 'A')}}, "ui-inspect-oversized-window-id");
+    require(malformed_inspect_window_id.value("state", std::string{}) == "Failed",
+            "ui.inspect must reject an optional window id above Core's 256-byte bound");
+    const auto empty_keyboard = run_core_job(core_worker, "keyboard.type", {{"text", ""}}, "keyboard-type-empty");
+    require(empty_keyboard.value("state", std::string{}) == "Failed",
+            "keyboard typing must reject empty text under the Core contract");
     const auto malformed_keyboard = run_core_job(core_worker, "keyboard.type",
         {{"text", std::string(4097, 'x')}}, "keyboard-type-oversized");
     require(malformed_keyboard.value("state", std::string{}) == "Failed",
             "keyboard typing must reject oversized text before input dispatch");
-    const auto oversized_keyboard_dispatch = run_core_job(core_worker, "keyboard.type",
-        {{"text", std::string(1025, 'x')}}, "keyboard-type-dispatch-bound");
-    require(oversized_keyboard_dispatch.value("state", std::string{}) == "Failed",
-            "keyboard typing must enforce the smaller per-call SendInput bound");
     const auto malformed_extra = run_core_job(core_worker, "window.list",
         {{"include_all_windows", true}}, "window-list-extra-argument");
     require(malformed_extra.value("state", std::string{}) == "Failed",
             "browser discovery must reject arguments outside its empty schema");
     const auto malformed_window_id = run_core_job(core_worker, "window.focus",
-        {{"window_id", std::string(129, 'A')}}, "window-focus-oversized-id");
+        {{"window_id", std::string(257, 'A')}}, "window-focus-oversized-id");
     require(malformed_window_id.value("state", std::string{}) == "Failed",
             "window.focus must reject an oversized window id");
     const auto malformed_control_id = run_core_job(core_worker, "ui.focus",
         {{"window_id", window_id}, {"target", std::string(513, 'A')}}, "ui-focus-oversized-id");
     require(malformed_control_id.value("state", std::string{}) == "Failed",
             "ui.focus must reject an oversized automation id");
+    const auto malformed_focus_window_id = run_core_job(core_worker, "ui.focus",
+        {{"window_id", std::string(257, 'A')}, {"target", "send"}}, "ui-focus-oversized-window-id");
+    require(malformed_focus_window_id.value("state", std::string{}) == "Failed",
+            "ui.focus must reject a window id above Core's 256-byte bound");
+    const auto malformed_invoke_window_id = run_core_job(core_worker, "ui.invoke",
+        {{"window_id", std::string(257, 'A')}, {"target", "send"}, {"action", "click"}},
+        "ui-invoke-oversized-window-id");
+    require(malformed_invoke_window_id.value("state", std::string{}) == "Failed",
+            "ui.invoke must reject a window id above Core's 256-byte bound");
+    const auto malformed_invoke_target = run_core_job(core_worker, "ui.invoke",
+        {{"window_id", window_id}, {"target", std::string(513, 'A')}, {"action", "click"}},
+        "ui-invoke-oversized-target");
+    require(malformed_invoke_target.value("state", std::string{}) == "Failed",
+            "ui.invoke must reject a target above Core's 512-byte bound");
     const auto malformed_invoke = run_core_job(core_worker, "ui.invoke",
         {{"window_id", window_id}, {"target", "send"}, {"action", "execute_script"}},
         "ui-invoke-invalid-action");
     require(malformed_invoke.value("state", std::string{}) == "Failed",
             "ui.invoke must reject actions outside its fixed enum");
-    const auto unsupported_value_set = run_core_job(core_worker, "ui.invoke",
-        {{"window_id", window_id}, {"target", "send"}, {"action", "set_value"}},
-        "ui-invoke-value-not-in-core-contract");
-    require(unsupported_value_set.value("state", std::string{}) == "Failed",
-            "ui.invoke set_value must fail closed without a bounded value argument");
+    for (const auto* legacy_action : {"invoke", "set_value"}) {
+        const auto unsupported_legacy_action = run_core_job(core_worker, "ui.invoke",
+            {{"window_id", window_id}, {"target", "send"}, {"action", legacy_action}},
+            std::string("ui-invoke-legacy-") + legacy_action);
+        require(unsupported_legacy_action.value("state", std::string{}) == "Failed",
+                "ui.invoke must reject actions absent from the canonical Core contract");
+    }
     const auto malformed_key = run_core_job(core_worker, "keyboard.key",
         {{"key", "ENTER"}, {"modifiers", nlohmann::json::array({"ctrl", "shift", "alt", "win"})}},
         "keyboard-key-too-many-modifiers");
     require(malformed_key.value("state", std::string{}) == "Failed",
             "keyboard.key must reject oversized modifier lists");
+    const auto malformed_key_name = run_core_job(core_worker, "keyboard.key",
+        {{"key", "CTRL+X"}}, "keyboard-key-not-in-core-enum");
+    require(malformed_key_name.value("state", std::string{}) == "Failed",
+            "keyboard.key must reject keys outside Core's fixed enum");
 
     {
         laso::Config denied_config;
@@ -530,22 +591,20 @@ void run_tests() {
     if (browser_fixture.ready()) {
         const auto browser_id = handle_id(browser_fixture.window());
         (void)browser_fixture.allow_foreground();
-        const auto focus_result = run_core_job(core_worker, "window.focus",
+        const auto focused_window = run_core_capability(core_worker, "window.focus",
             {{"window_id", browser_id}}, "browser-window-focus");
-        if (focus_result.value("state", std::string{}) != "Completed") {
-            std::cout << "Browser UI Automation/input fixture skipped: Windows did not grant foreground activation\n";
-        } else {
-        const auto focused_window = focus_result.value("payload", nlohmann::json::object());
         require(focused_window.value("focused", false), "Core child window.focus did not focus the local browser fixture");
 
         std::string edit_id_from_browser;
         std::string button_id_from_browser;
+        std::string submit_id_from_browser;
         bool named_edit = false;
         bool named_button = false;
+        bool named_submit = false;
         nlohmann::json browser_tree;
         for (int attempt = 0; attempt < 40; ++attempt) {
             browser_tree = run_core_capability(core_worker, "ui.inspect",
-                {{"window_id", browser_id}},
+                nlohmann::json::object(),
                 "browser-ui-inspect-" + std::to_string(attempt));
             require(browser_tree.at("elements").size() <= 32, "browser UI Automation exceeded its node bound");
             for (const auto& item : browser_tree.at("elements")) {
@@ -554,10 +613,13 @@ void run_tests() {
                         "browser UI Automation returned an unbounded property");
                 if (item.value("automation_id", std::string{}) == "chat") edit_id_from_browser = "chat";
                 if (item.value("automation_id", std::string{}) == "send") button_id_from_browser = "send";
+                if (item.value("automation_id", std::string{}) == "submit") submit_id_from_browser = "submit";
                 if (item.value("name", std::string{}) == "Lane 4 fixture message") named_edit = true;
                 if (item.value("name", std::string{}) == "Send fixture") named_button = true;
+                if (item.value("name", std::string{}) == "Submit fixture") named_submit = true;
             }
-            if ((!edit_id_from_browser.empty() || named_edit) && (!button_id_from_browser.empty() || named_button)) break;
+            if ((!edit_id_from_browser.empty() || named_edit) && (!button_id_from_browser.empty() || named_button) &&
+                (!submit_id_from_browser.empty() || named_submit)) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         require(!edit_id_from_browser.empty() || named_edit,
@@ -571,7 +633,7 @@ void run_tests() {
         bool typed_text_observed = false;
         for (int attempt = 0; attempt < 40; ++attempt) {
             browser_tree = run_core_capability(core_worker, "ui.inspect",
-                {{"window_id", browser_id}},
+                nlohmann::json::object(),
                 "browser-ui-inspect-typed-" + std::to_string(attempt));
             if (browser_tree.dump().find("LANE4-TYPED-OK") != std::string::npos) { typed_text_observed = true; break; }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -582,29 +644,69 @@ void run_tests() {
         bool key_observed = false;
         for (int attempt = 0; attempt < 40; ++attempt) {
             browser_tree = run_core_capability(core_worker, "ui.inspect",
-                {{"window_id", browser_id}},
+                nlohmann::json::object(),
                 "browser-ui-inspect-key-" + std::to_string(attempt));
             if (browser_tree.dump().find("LANE4-KEY-DISPATCH-OK") != std::string::npos) { key_observed = true; break; }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         require(key_observed, "keyboard.key did not reach the focused browser fixture control");
+        const auto maximum_text = run_core_capability(core_worker, "keyboard.type",
+            {{"text", std::string(4096, 'x')}}, "browser-keyboard-type-maximum");
+        require(maximum_text.value("typed_chars", 0U) == 4096U,
+                "keyboard.type did not accept Core's maximum text length");
 
         const std::string button_target = !button_id_from_browser.empty() ? button_id_from_browser : std::string("Send fixture");
-        nlohmann::json invoke_args{{"window_id", browser_id}, {"target", button_target}, {"action", "invoke"}};
+        nlohmann::json invoke_args{{"window_id", browser_id}, {"target", button_target}, {"action", "click"}};
         require(!button_id_from_browser.empty() || named_button,
                 "UI Automation did not expose the local browser fixture's send control");
         const auto invoked = run_core_capability(core_worker, "ui.invoke", invoke_args, "browser-ui-invoke");
-        require(invoked.value("performed", "") == "invoke", "UI Automation did not invoke the local browser fixture control");
+        require(invoked.value("performed", "") == "click", "UI Automation did not click the local browser fixture control");
         bool invoke_observed = false;
         for (int attempt = 0; attempt < 40; ++attempt) {
             browser_tree = run_core_capability(core_worker, "ui.inspect",
-                {{"window_id", browser_id}},
+                nlohmann::json::object(),
                 "browser-ui-inspect-invoke-" + std::to_string(attempt));
-            if (browser_tree.dump().find("LANE4-INVOKE-OK") != std::string::npos) { invoke_observed = true; break; }
+            if (browser_tree.dump().find("LANE4-CLICK-OK") != std::string::npos) { invoke_observed = true; break; }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         require(invoke_observed, "ui.invoke did not reach the local browser fixture control");
+
+        const std::string submit_target = !submit_id_from_browser.empty() ? submit_id_from_browser : std::string("Submit fixture");
+        require(!submit_id_from_browser.empty() || named_submit,
+                "UI Automation did not expose the local browser fixture's submit control");
+        const auto submitted = run_core_capability(core_worker, "ui.invoke",
+            {{"window_id", browser_id}, {"target", submit_target}, {"action", "submit"}}, "browser-ui-submit");
+        require(submitted.value("performed", "") == "submit", "UI Automation did not submit the local browser fixture form");
+        bool submit_observed = false;
+        for (int attempt = 0; attempt < 40; ++attempt) {
+            browser_tree = run_core_capability(core_worker, "ui.inspect", nlohmann::json::object(),
+                "browser-ui-inspect-submit-" + std::to_string(attempt));
+            if (browser_tree.dump().find("LANE4-SUBMIT-OK") != std::string::npos) { submit_observed = true; break; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
+        require(submit_observed, "ui.invoke submit did not reach the local browser fixture form");
+
+        const auto double_click = run_core_capability(core_worker, "ui.invoke",
+            {{"window_id", browser_id}, {"target", button_target}, {"action", "double_click"}},
+            "browser-ui-double-click");
+        require(double_click.value("performed", "") == "double_click",
+                "UI Automation did not perform the bounded double-click action");
+        bool double_click_observed = false;
+        for (int attempt = 0; attempt < 40; ++attempt) {
+            browser_tree = run_core_capability(core_worker, "ui.inspect", nlohmann::json::object(),
+                "browser-ui-inspect-double-click-" + std::to_string(attempt));
+            if (browser_tree.dump().find("LANE4-DOUBLE-CLICK-OK") != std::string::npos) {
+                double_click_observed = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        require(double_click_observed, "bounded UIA double-click did not activate the fixture control twice");
+        const auto disabled_double_click = run_core_job(core_worker, "ui.invoke",
+            {{"window_id", browser_id}, {"target", "disabled"}, {"action", "double_click"}},
+            "browser-ui-double-click-disabled-target");
+        require(disabled_double_click.value("state", std::string{}) == "Failed",
+                "double_click must fail closed for a disabled UI Automation target");
     }
 
     std::ifstream audit(audit_path, std::ios::binary);

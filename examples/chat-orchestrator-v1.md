@@ -2,8 +2,19 @@
 
 Use `chat-orchestrator-v1.json` as an explicit LASO-Computer endpoint configuration for a local chat-orchestrator worker. It follows default deny. Status is allowed. Window discovery returns only visible supported-browser windows whose title identifies ChatGPT, with a generic label and an active-window flag; conversation titles are not returned. UI Automation inspection, window/control focus, control invocation, and keyboard input require a correlated Core approval. Inspection is approval-gated because accessible names can include visible page content. Keyboard input also fails closed unless the foreground window is a ChatGPT browser. Approval is fail-closed if Core is disconnected or the response is absent, denied, expired, or malformed.
 
-The current Core worker profile allows `ui.invoke` with a target and action but has no value field. The first profile should use `action: "invoke"`; `set_value` remains rejected without a bounded value argument. Use the approved `keyboard.type` path for text entry.
+## Canonical tool arguments
 
-`window.list` reports at most 32 visible ChatGPT browser windows and replaces each window title with the constant `ChatGPT`. `ui.inspect` returns at most 32 control nodes at depth 8; each control name is capped at 256 characters and each automation ID at 128. It does not return values from the Windows clipboard or capture the whole desktop. Keyboard text is limited to 1024 bytes per call.
+| Tool | Accepted arguments |
+| --- | --- |
+| `browser.status` | `{}` |
+| `window.list` | `{}` |
+| `window.focus` | Required non-empty `window_id`, at most 256 bytes |
+| `ui.inspect` | Optional non-empty `window_id`, at most 256 bytes; omitted means foreground ChatGPT window |
+| `ui.focus` | Required non-empty `window_id` (256 bytes max) and `target` (512 bytes max) |
+| `ui.invoke` | Required non-empty `window_id` (256 bytes max), `target` (512 bytes max), and `action` in `click`, `double_click`, `submit` |
+| `keyboard.type` | Required non-empty `text`, at most 4096 bytes |
+| `keyboard.key` | Required `key`: `ENTER`, `ESC`, `TAB`, `SPACE`, `BACKSPACE`, `DELETE`, `UP`, `DOWN`, `LEFT`, `RIGHT`, `HOME`, or `END` |
+
+`window.list` reports at most 32 visible ChatGPT browser windows and replaces each window title with the constant `ChatGPT`. `ui.inspect` returns at most 32 control nodes at depth 8, with each name capped at 256 UTF-16 characters and automation ID at 128. UIA `click` and `submit` map to the Invoke pattern. `double_click` resolves one unique target and derives its rectangle from UI Automation. The provider requires the target to be enabled, on-screen, non-empty, fully contained by the foreground ChatGPT window, and within virtual desktop bounds; it then sends exactly two left-button clicks at the rectangle center after checking cancellation and foreground identity. The request schema accepts no coordinates. Inspection does not return clipboard values or capture the whole desktop.
 
 `screen.capture`, pointer actions, clipboard access, shell execution, and Playwright browser actions remain denied by the default. Do not merge this example into a user's existing configuration without reviewing and backing up that configuration. Pass the example explicitly with `--config` for an isolated endpoint process.
