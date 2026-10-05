@@ -119,14 +119,14 @@ std::string handle_id(HWND window) {
 std::filesystem::path find_test_browser() {
     std::vector<std::filesystem::path> candidates;
     if (const auto* program_files_x86 = _wgetenv(L"ProgramFiles(x86)"))
-        candidates.emplace_back(std::filesystem::path(program_files_x86) / L"Microsoft\Edge\Application\msedge.exe");
+        candidates.emplace_back(std::filesystem::path(program_files_x86) / LR"(Microsoft\Edge\Application\msedge.exe)");
     if (const auto* program_files = _wgetenv(L"ProgramFiles")) {
-        candidates.emplace_back(std::filesystem::path(program_files) / L"Microsoft\Edge\Application\msedge.exe");
-        candidates.emplace_back(std::filesystem::path(program_files) / L"Google\Chrome\Application\chrome.exe");
+        candidates.emplace_back(std::filesystem::path(program_files) / LR"(Microsoft\Edge\Application\msedge.exe)");
+        candidates.emplace_back(std::filesystem::path(program_files) / LR"(Google\Chrome\Application\chrome.exe)");
     }
     if (const auto* local_app_data = _wgetenv(L"LOCALAPPDATA")) {
-        candidates.emplace_back(std::filesystem::path(local_app_data) / L"Microsoft\Edge\Application\msedge.exe");
-        candidates.emplace_back(std::filesystem::path(local_app_data) / L"Google\Chrome\Application\chrome.exe");
+        candidates.emplace_back(std::filesystem::path(local_app_data) / LR"(Microsoft\Edge\Application\msedge.exe)");
+        candidates.emplace_back(std::filesystem::path(local_app_data) / LR"(Google\Chrome\Application\chrome.exe)");
     }
     for (const auto& candidate : candidates) if (std::filesystem::is_regular_file(candidate)) return candidate;
     return {};
