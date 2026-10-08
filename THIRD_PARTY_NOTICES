@@ -1,9 +1,0 @@
-# Third-party notices
-
-LASO-Computer C++ uses the following third-party code:
-
-- **nlohmann/json 3.11.3** — MIT License. Vendored single header: `third_party/nlohmann_json/include/nlohmann/json.hpp`. License: `third_party/nlohmann_json/LICENSE.MIT`.
-
-The Playwright MCP package is an optional external integration and is not vendored in source. Its selected npm release and transitive lockfile are Apache-2.0 licensed; see `plugins/playwright/package-lock.json` and `docs/third-party-integrations.md`. Playwright MCP is currently unavailable under the tested AppContainer configuration and is not required to build the core.
-
-Windows APIs are provided by the Windows SDK. UFO/UFO², Agent-S, UI-TARS Desktop, browser-use, Open Interpreter, and Playwright CLI were reviewed as references only; their source code is not included.

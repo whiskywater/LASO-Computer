@@ -24,13 +24,13 @@ type linuxDriver struct{}
 func NewDesktop() Desktop { return linuxDriver{} }
 
 func (linuxDriver) Available() map[string]bool {
-	result := map[string]bool{"screen.capture": false, "pointer.move": false, "pointer.click": false, "keyboard.type": false, "keyboard.key": false, "clipboard.read": false, "clipboard.write": false, "window.list": false, "window.focus": false, "browser.navigate": false}
+	result := map[string]bool{"screen.capture": false, "pointer.move": false, "pointer.click": false, "keyboard.type": false, "keyboard.key": false, "clipboard.read": false, "clipboard.write": false, "window.list": false, "browser.status": false, "window.focus": false, "browser.navigate": false}
 	conn, err := xgb.NewConn()
 	if err == nil {
 		screen, err := rootScreen(conn)
 		if err == nil && screen.WidthInPixels > 0 && screen.HeightInPixels > 0 {
 			result["screen.capture"] = true
-			result["window.list"], result["window.focus"] = true, true
+			result["window.list"], result["browser.status"], result["window.focus"] = true, true, true
 			if xtest.Init(conn) == nil {
 				result["pointer.move"], result["pointer.click"], result["keyboard.type"], result["keyboard.key"] = true, true, true, true
 			}

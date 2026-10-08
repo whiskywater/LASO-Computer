@@ -2,46 +2,50 @@
 
 ## Responsibility boundary
 
-| LASO backend | LASO-Computer endpoint |
+| LASO backend | LASO Computer endpoint |
 | --- | --- |
-| Orchestration, worker selection, jobs and durable sessions | Local Windows runtime and OS APIs |
-| Workflow policy and server-side permissions | Independent endpoint capability policy |
-| Durable approval records and cancellation coordination | Fail-closed local approval gate and cooperative cancellation |
-| Audit coordination and retained history | Redacted local action attribution |
+| Agent/task orchestration and worker selection | OS desktop APIs and local process execution |
+| Durable job and session ownership | Screen, pointer, keyboard, clipboard, and window operations |
+| Organization, user, agent, job, and worker policy | Local capability registry and a second authorization check |
+| Approval requests and durable decisions | Pause an action while LASO resolves an approval |
+| Worker leases, heartbeats, cancellation, and recovery | Cooperative cancellation and sanitized results |
+| Audit/control-plane event persistence | Redacted endpoint execution audit |
 
-LASO-Computer is an endpoint worker, not LASO core. The currently intended transport is a locally supervised process using standard input/output; there is no listener or remote endpoint enrollment.
+Desktop-control implementations stay in this repository. The LASO backend should dispatch an authorized worker request and retain durable ownership; it should not call OS desktop APIs itself.
 
-## Native runtime
+## Current integration boundary
 
-- `src/main.cpp`: command line and process composition.
-- `src/config.cpp`: bounded configuration parsing, validation, and serialization.
-- `src/protocol.cpp`: JSONL framing, worker job lifecycle, cancellation, and result semantics.
-- `src/plugin.cpp`: named capability provider registry and invocation boundary.
-- `src/audit.cpp`: redacted local JSONL events.
-- `src/windows_platform.cpp`: Win32 capture, input, clipboard, windows, UI Automation, and direct process execution.
-- `src/playwright.cpp`: optional out-of-process MCP adapter.
-- `include/laso`: stable subsystem interfaces used by the executable and tests.
+LASO documents a versioned newline-delimited JSON process-worker protocol (v1). LASO supervises this executable, sends one request frame at a time, and owns the durable worker-job identifier. LASO Computer implements the protocol's `hello`, `submit`, `status`, `result`, `cancel`, and `shutdown` operations. A `submit` payload contains a capability name, structured arguments, and optional agent/session identifiers. Each capability request goes through the local policy-enforcing executor.
 
-The process-protocol implementation centrally limits incoming/outgoing frames to 1 MiB. A valid worker job result in `Failed`, `Cancelled`, or `TimedOut` is still a successful protocol `result` operation. This behavior has unit coverage but has not been validated against a matching public LASO contract.
+The process protocol already carries durable job/session context and a narrow worker-originated `permission` request/response. The endpoint uses that for `require_approval`; it never auto-approves. Frames, jobs, output, and approval waits are bounded. A repeated request ID with identical bytes replays the initial response. Reusing an ID with different content is rejected. LASO's worker manager remains responsible for durable deduplication across process restarts; an ambiguous operation after restart must remain unknown rather than being resubmitted automatically.
 
-## Provider contract
+The concrete protocol is documented in LASO's `docs/worker-process-protocol.md` and worker lifecycle in `docs/workers.md`. Those repositories remain unchanged by this project.
 
-Providers declare identity/version, named capability descriptions/schemas, invoke structured JSON with a timeout and cancellation token, report health, and shut down through lifecycle hooks. A capability may set `CapabilityDescriptor::requires_synchronous_interactions` when it needs a Core permission decision or question answer. For that capability the Core submit exchange remains open until provider execution completes, so it cannot emit an interaction after acknowledging submission; ordinary capabilities keep the asynchronous submit path. The `InvocationContext::request_interaction` callback accepts only `permission` and `question`; interactive providers must request permission before the dependent action and proceed only on `approved`, while questions proceed only on `answered`. Local endpoint policy still runs first, and `deny` remains authoritative. Because the process protocol allows only one outstanding request, Core cannot send a regular job cancellation while an opted-in submit is waiting. A correlated interaction response of `cancelled` maps to a cancelled job; Core job cancellation before submit completes terminates the worker process. The registry binds provider capabilities to endpoint policy and records provider attribution. Registration is not authorization. Results are checked against configured bounds at the transport boundary. Native provider DLL loading is deliberately not provided.
+## Runtime modules
 
-## Capability selection
+- `cmd/laso-computer`: command-line status/configuration commands and process lifetime.
+- `internal/catalog`: capability names and descriptions.
+- `internal/capabilities`: registration, guarded dispatch, argument validation, OS-neutral handlers, and shell restrictions.
+- `internal/policy`: local `allow`, `require_approval`, and `deny` decisions.
+- `internal/transport`: bounded stdio framing and correlated LASO permission requests.
+- `internal/client`: process-worker job state, cancellation, result handling, and request replay protection.
+- `internal/platform`: separate Windows API and Linux X11 drivers.
+- `internal/audit`, `internal/config`, and `internal/identity`: local audit, configuration validation, and random persistent client identity.
 
-Browser jobs should use browser-native structured DOM operations through Playwright. Native Windows applications should use UI Automation and Win32 state before low-level coordinate input. `SendInput` is the last native interaction primitive when structured controls are unavailable. UFO/UFO² were reviewed as architectural references for UIA/Win32/COM composition and were not embedded. Agent-S and UI-TARS are possible future visual fallback providers, not current dependencies.
+The executor receives platform handlers only through the registry. Transport callers do not receive raw platform-driver methods, so invoking a capability still passes through local authorization.
 
-Playwright uses split containment: C++ directly launches the configured Edge executable into a unique LASO-managed profile and owns its process tree in a kill-on-close Job Object; a separate AppContainerized MCP process attaches to that browser through CDP. The C++ runtime selects an ephemeral port, asks Edge to bind only `127.0.0.1`, verifies `/json/version` and the owning listener PID, then configures pinned MCP 0.0.83 through its shipped `browser.cdpEndpoint` option. MCP has no network capabilities and its job permits only the provider process, preventing it from spawning Edge.
+## Current remote endpoint path
 
-On the Windows test host, the pinned MCP package's guarded named-pipe namespace patch is present. The first browser call also exposed a Node/libuv `GetFinalPathNameByHandleW(VOLUME_NAME_DOS)` AppContainer limitation; ACL experiments did not fix it and no broad volume permission was granted. MCP's documented `--allow-unrestricted-file-access` option skips its own canonical-path guard; AppContainer ACLs, the one-process Job Object, typed C++ tools, and C++ URL validation remain in force. Current Debug testing found AppContainer MCP's HTTP request to the valid local CDP endpoint times out when the loopback-exemption list is empty. The same C++-owned Edge, port-0 discovery, MCP package, and complete fixture pass outside AppContainer for diagnosis, so the endpoint form and Edge process limits are not the cause. The production sandbox remains enabled; no exemption was restored. Clean npm install and hosted browser acceptance remain unverified. See [the provider record](playwright-provider.md).
+The Windows deployment runs the existing versioned LASO worker protocol over a loopback TCP listener. The `--supervise` mode keeps an authenticated SSH reverse tunnel connected to the Server1300 loopback port, where Core's process worker bridges the protocol to the endpoint. Both the worker listener and health endpoints bind only to IPv4 loopback; they are not exposed on the LAN or the public network. SSH supplies transport encryption and authenticates the connecting workstation. Restrict the SSH identity to the one remote-forward port and follow the deployment steps in [`remote-loopback-worker.md`](remote-loopback-worker.md).
 
-An optional LocalSystem development broker is a separate executable and service with a fixed named-pipe RPC surface. It supports only status, fixed AppContainer SID lookup, and inspection/removal of that AppContainer's legacy loopback exemption. It is installed only during attended bootstrap, authorizes the bootstrapped interactive user SID, rejects remote pipe clients, audits operations, and offers no generic elevation facility. See [unattended Windows development](unattended-windows-development.md).
+The executor and local capability policy remain active on the endpoint for every request. This transport does not add application-level TLS, endpoint enrollment, or capability-grant versioning and revocation; it relies on a controlled SSH identity and loopback-only forwarding.
 
-## Protocol status
+```text
+LASO orchestration and policy
+  → loopback worker listener behind an authenticated SSH reverse tunnel
+  → endpoint request validation and local policy
+  → registered capability handler
+  → Windows or Linux API
+```
 
-The worker uses the current process-worker v1 contract: bounded newline-delimited JSON, request correlation, submit-assigned external job IDs, and lifecycle operations for hello, status, submit, result, cancel, and shutdown. During an active submit, Core may issue correlated `worker_request` messages and replies with `worker_response`; approval decisions are accepted only when exactly `approved`. Providers may opt into permission and question exchanges through their capability descriptor and invocation context. Permission proceeds only on `approved`, questions only on `answered`, and cancellation/expiry remain terminal job outcomes. These exchanges are covered by worker-level tests; a live Core-to-Windows-worker acceptance run remains unverified.
-
-## Not implemented
-
-Remote enrollment/transport, leased remote endpoints, dynamic DLL loading, filesystem transfer, Agent-S/UI-TARS visual interaction, and a protected local emergency stop surface remain future work.
+The worker protocol retains bounded frames, replay protection, and cancellation. The tunnel supervisor reconnects after transport loss; an in-flight action whose response is lost remains uncertain and must be reconciled rather than replayed. Endpoint enrollment and capability-grant versioning/revocation are not part of this SSH-based deployment.

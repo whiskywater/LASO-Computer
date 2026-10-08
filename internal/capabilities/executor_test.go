@@ -194,6 +194,28 @@ func TestAuditDoesNotRecordSensitiveArguments(t *testing.T) {
 	}
 }
 
+func TestAuditFailureStopsAllowedCapability(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	writer, err := audit.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ex, d := testExecutor(t, policy.Allow, writer)
+	_, err = ex.Invoke(context.Background(), Invocation{RequestID: "req-audit-failure", Capability: "screen.capture", Arguments: json.RawMessage(`{}`)})
+	if !errors.Is(err, ErrAudit) {
+		t.Fatalf("expected audit failure, got %v", err)
+	}
+	if d.calls.Load() != 0 {
+		t.Fatal("capability ran without a durable started audit event")
+	}
+	if writer.Err() == nil {
+		t.Fatal("writer did not retain its append failure")
+	}
+}
+
 func TestBrowserNavigationRejectsNonWebSchemes(t *testing.T) {
 	d := &testDesktop{}
 	cfg := config.Default()
@@ -206,8 +228,8 @@ func TestBrowserNavigationRejectsNonWebSchemes(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = ex.Invoke(context.Background(), Invocation{RequestID: "req-url", Capability: "browser.navigate", Arguments: json.RawMessage(`{"url":"file:///private/data"}`)})
-	if !errors.Is(err, ErrInvalid) {
-		t.Fatalf("expected URL validation failure, got %v", err)
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("expected managed browser to fail closed while unavailable, got %v", err)
 	}
 	if d.calls.Load() != 0 {
 		t.Fatal("invalid URL reached platform opener")

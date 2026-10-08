@@ -1,36 +1,9 @@
-/build-*/
-/build/
-/out/
-/dist/
-/CMakeFiles/
-/CMakeCache.txt
-/Testing/
-*.vcxproj
-*.sln
-*.user
-*.pdb
-*.ilk
-*.obj
-*.lib
-*.exe
-*.dll
-*.test
-*.prof
-coverage.out
-
-# Local policy, identity, and audit
+# Local policy and identity
 config.json
 client-id
 audit.jsonl
 .env
 .env.*
-
-# Local Playwright dependencies and state
-plugins/playwright/node_modules/
-plugins/playwright/.profile/
-plugins/playwright/.tmp/
-
-# Credentials and keys
 .ssh/
 known_hosts
 authorized_keys
@@ -42,7 +15,7 @@ id_ed25519*
 *.pfx
 *.ppk
 
-# Test captures and machine artifacts
+# Test captures and local output
 *.png
 *.jpg
 *.jpeg
@@ -50,8 +23,19 @@ id_ed25519*
 *.log
 *.core
 *.dmp
-Thumbs.db
-.DS_Store
+testdata/local/
+out/
+dist/
+# Local application state from desktop smoke tests
+*.db
+
+# Go and editor output
+/laso-computer
+/laso-computer.exe
+*.test
+*.prof
+coverage.out
 .idea/
 .vscode/
-/work/
+.DS_Store
+Thumbs.db

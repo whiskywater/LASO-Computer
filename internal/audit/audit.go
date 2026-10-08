@@ -23,8 +23,9 @@ type Event struct {
 }
 
 type Writer struct {
-	mu sync.Mutex
-	f  *os.File
+	mu  sync.Mutex
+	f   *os.File
+	err error
 }
 
 func Open(path string) (*Writer, error) {
@@ -48,19 +49,51 @@ func filepathDir(path string) string {
 }
 
 func (w *Writer) Record(event Event) {
-	if w == nil || w.f == nil {
+	if w == nil {
 		return
 	}
 	event.Time = time.Now().UTC()
 	event.PayloadRedacted = true
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	_ = json.NewEncoder(w.f).Encode(event)
+	if w.f == nil || w.err != nil {
+		if w.f == nil && w.err == nil {
+			w.err = os.ErrClosed
+		}
+		return
+	}
+	if err := json.NewEncoder(w.f).Encode(event); err != nil {
+		w.err = err
+		return
+	}
+	if err := w.f.Sync(); err != nil {
+		w.err = err
+	}
+}
+
+// Err reports the first durable audit write failure. It is safe to call while
+// records are being appended.
+func (w *Writer) Err() error {
+	if w == nil {
+		return nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.err
 }
 
 func (w *Writer) Close() error {
-	if w == nil || w.f == nil {
+	if w == nil {
 		return nil
 	}
-	return w.f.Close()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.f == nil {
+		return w.err
+	}
+	if err := w.f.Close(); err != nil && w.err == nil {
+		w.err = err
+	}
+	w.f = nil
+	return w.err
 }

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Registered-Agent-Attorney/LASO-Computer/internal/audit"
+	"github.com/Registered-Agent-Attorney/LASO-Computer/internal/catalog"
 	"github.com/Registered-Agent-Attorney/LASO-Computer/internal/policy"
 )
 
@@ -20,6 +21,7 @@ var (
 	ErrUnavailable = errors.New("capability unavailable on this endpoint")
 	ErrInvalid     = errors.New("invalid capability request")
 	ErrFailed      = errors.New("capability failed")
+	ErrAudit       = errors.New("capability audit unavailable")
 )
 
 type Principal struct {
@@ -94,42 +96,66 @@ func (e *Executor) Invoke(ctx context.Context, call Invocation) (json.RawMessage
 	}
 	handler, ok := e.registry.handlers[call.Capability]
 	if !ok {
-		e.record(audit.Event{RequestID: call.RequestID, Capability: "unknown", Decision: "deny", Outcome: "unknown_capability", JobID: call.Principal.JobID, SessionID: call.Principal.SessionID, AgentID: call.Principal.AgentID})
+		if err := e.record(audit.Event{RequestID: call.RequestID, Capability: "unknown", Decision: "deny", Outcome: "unknown_capability", JobID: call.Principal.JobID, SessionID: call.Principal.SessionID, AgentID: call.Principal.AgentID}); err != nil {
+			return nil, err
+		}
 		return nil, ErrUnknown
 	}
 	decision := e.policy.Decide(call.Capability)
 	base := audit.Event{RequestID: call.RequestID, JobID: call.Principal.JobID, SessionID: call.Principal.SessionID, AgentID: call.Principal.AgentID, Capability: call.Capability, Decision: string(decision), Outcome: "denied"}
 	if decision == policy.Deny {
-		e.record(base)
+		if err := e.record(base); err != nil {
+			return nil, err
+		}
 		return nil, ErrDenied
+	}
+	if err := validateArguments(call.Capability, call.Arguments); err != nil {
+		base.Outcome = "invalid_arguments"
+		if recordErr := e.record(base); recordErr != nil {
+			return nil, recordErr
+		}
+		return nil, ErrInvalid
 	}
 	if decision == policy.RequireApproval {
 		if e.approve == nil {
-			e.record(base)
+			if err := e.record(base); err != nil {
+				return nil, err
+			}
 			return nil, ErrApproval
 		}
 		approved, err := e.approve(ctx, call.Capability, call.Principal)
 		if err != nil || !approved {
 			base.Outcome = "approval_denied"
-			e.record(base)
+			if recordErr := e.record(base); recordErr != nil {
+				return nil, recordErr
+			}
 			return nil, ErrApproval
 		}
 		base.Outcome = "approved"
-		e.record(base)
+		if err := e.record(base); err != nil {
+			return nil, err
+		}
 	}
 	if !e.available[call.Capability] {
 		base.Outcome = "unavailable"
-		e.record(base)
+		if err := e.record(base); err != nil {
+			return nil, err
+		}
 		return nil, ErrUnavailable
 	}
 	if err := ctx.Err(); err != nil {
 		base.Outcome = "cancelled"
-		e.record(base)
+		if recordErr := e.record(base); recordErr != nil {
+			return nil, recordErr
+		}
 		return nil, err
 	}
 	base.Outcome = "started"
 	started := time.Now()
-	e.record(base)
+	if err := e.record(base); err != nil {
+		return nil, err
+	}
+	ctx = context.WithValue(ctx, principalContextKey{}, call.Principal)
 	result, err := handler(ctx, call.Arguments)
 	base.DurationMS = time.Since(started).Milliseconds()
 	switch {
@@ -140,17 +166,23 @@ func (e *Executor) Invoke(ctx context.Context, call Invocation) (json.RawMessage
 	default:
 		base.Outcome = "completed"
 	}
-	e.record(base)
+	if recordErr := e.record(base); recordErr != nil {
+		return nil, recordErr
+	}
 	if err != nil {
 		return nil, err
 	}
 	return result, nil
 }
 
-func (e *Executor) record(event audit.Event) {
+func (e *Executor) record(event audit.Event) error {
 	if e.audit != nil {
 		e.audit.Record(event)
+		if reporter, ok := e.audit.(interface{ Err() error }); ok && reporter.Err() != nil {
+			return ErrAudit
+		}
 	}
+	return nil
 }
 
 func sortStrings(values []string) {
@@ -159,4 +191,101 @@ func sortStrings(values []string) {
 			values[j], values[j-1] = values[j-1], values[j]
 		}
 	}
+}
+
+// validateArguments translates the frozen JSON Schema subset in the shared catalog
+// at the capability boundary. It rejects unknown keys, wrong types, missing fields,
+// and values outside the published enum/length/range bounds before a handler runs.
+func validateArguments(name string, raw json.RawMessage) error {
+	var descriptor *catalog.Descriptor
+	for _, item := range catalog.List() {
+		if item.Name == name {
+			copy := item
+			descriptor = &copy
+			break
+		}
+	}
+	if descriptor == nil || len(descriptor.InputSchema) == 0 {
+		return nil
+	}
+	var schema struct {
+		AdditionalProperties bool     `json:"additionalProperties"`
+		Required             []string `json:"required"`
+		Properties           map[string]struct {
+			Type      string   `json:"type"`
+			MinLength *int     `json:"minLength"`
+			MaxLength *int     `json:"maxLength"`
+			Enum      []string `json:"enum"`
+			Minimum   *int     `json:"minimum"`
+			Maximum   *int     `json:"maximum"`
+		} `json:"properties"`
+	}
+	if json.Unmarshal(descriptor.InputSchema, &schema) != nil {
+		return ErrInvalid
+	}
+	var fields map[string]json.RawMessage
+	if len(raw) == 0 {
+		raw = []byte("{}")
+	}
+	if json.Unmarshal(raw, &fields) != nil || fields == nil {
+		return ErrInvalid
+	}
+	for _, key := range schema.Required {
+		if _, ok := fields[key]; !ok {
+			return ErrInvalid
+		}
+	}
+	for key, value := range fields {
+		prop, ok := schema.Properties[key]
+		if !ok {
+			if !schema.AdditionalProperties {
+				return ErrInvalid
+			}
+			continue
+		}
+		var kind any
+		if json.Unmarshal(value, &kind) != nil {
+			return ErrInvalid
+		}
+		switch prop.Type {
+		case "string":
+			text, ok := kind.(string)
+			if !ok {
+				return ErrInvalid
+			}
+			n := len([]byte(text))
+			if prop.MinLength != nil && n < *prop.MinLength {
+				return ErrInvalid
+			}
+			if prop.MaxLength != nil && n > *prop.MaxLength {
+				return ErrInvalid
+			}
+			if len(prop.Enum) > 0 {
+				found := false
+				for _, v := range prop.Enum {
+					if text == v {
+						found = true
+						break
+					}
+				}
+				if !found {
+					return ErrInvalid
+				}
+			}
+		case "integer":
+			number, ok := kind.(float64)
+			if !ok || number != float64(int64(number)) {
+				return ErrInvalid
+			}
+			if prop.Minimum != nil && number < float64(*prop.Minimum) {
+				return ErrInvalid
+			}
+			if prop.Maximum != nil && number > float64(*prop.Maximum) {
+				return ErrInvalid
+			}
+		default:
+			return ErrInvalid
+		}
+	}
+	return nil
 }

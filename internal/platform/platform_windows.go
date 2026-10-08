@@ -17,42 +17,45 @@ import (
 )
 
 var (
-	user32                 = syscall.NewLazyDLL("user32.dll")
-	gdi32                  = syscall.NewLazyDLL("gdi32.dll")
-	kernel32               = syscall.NewLazyDLL("kernel32.dll")
-	getSystemMetrics       = user32.NewProc("GetSystemMetrics")
-	getDC                  = user32.NewProc("GetDC")
-	releaseDC              = user32.NewProc("ReleaseDC")
-	createCompatibleDC     = gdi32.NewProc("CreateCompatibleDC")
-	createCompatibleBitmap = gdi32.NewProc("CreateCompatibleBitmap")
-	selectObject           = gdi32.NewProc("SelectObject")
-	bitBlt                 = gdi32.NewProc("BitBlt")
-	getDIBits              = gdi32.NewProc("GetDIBits")
-	deleteObject           = gdi32.NewProc("DeleteObject")
-	deleteDC               = gdi32.NewProc("DeleteDC")
-	setCursorPos           = user32.NewProc("SetCursorPos")
-	mouseEvent             = user32.NewProc("mouse_event")
-	sendInput              = user32.NewProc("SendInput")
-	openClipboard          = user32.NewProc("OpenClipboard")
-	closeClipboard         = user32.NewProc("CloseClipboard")
-	emptyClipboard         = user32.NewProc("EmptyClipboard")
-	getClipboardData       = user32.NewProc("GetClipboardData")
-	setClipboardData       = user32.NewProc("SetClipboardData")
-	globalAlloc            = kernel32.NewProc("GlobalAlloc")
-	globalLock             = kernel32.NewProc("GlobalLock")
-	globalUnlock           = kernel32.NewProc("GlobalUnlock")
-	globalFree             = kernel32.NewProc("GlobalFree")
-	globalSize             = kernel32.NewProc("GlobalSize")
-	getCurrentProcess      = kernel32.NewProc("GetCurrentProcess")
-	readProcessMemory      = kernel32.NewProc("ReadProcessMemory")
-	writeProcessMemory     = kernel32.NewProc("WriteProcessMemory")
-	enumWindows            = user32.NewProc("EnumWindows")
-	isWindowVisible        = user32.NewProc("IsWindowVisible")
-	getWindowText          = user32.NewProc("GetWindowTextW")
-	getForegroundWindow    = user32.NewProc("GetForegroundWindow")
-	showWindow             = user32.NewProc("ShowWindow")
-	setForegroundWindow    = user32.NewProc("SetForegroundWindow")
-	shellExecute           = user32.NewProc("ShellExecuteW")
+	user32                   = syscall.NewLazyDLL("user32.dll")
+	gdi32                    = syscall.NewLazyDLL("gdi32.dll")
+	kernel32                 = syscall.NewLazyDLL("kernel32.dll")
+	getSystemMetrics         = user32.NewProc("GetSystemMetrics")
+	getDC                    = user32.NewProc("GetDC")
+	releaseDC                = user32.NewProc("ReleaseDC")
+	createCompatibleDC       = gdi32.NewProc("CreateCompatibleDC")
+	createCompatibleBitmap   = gdi32.NewProc("CreateCompatibleBitmap")
+	selectObject             = gdi32.NewProc("SelectObject")
+	bitBlt                   = gdi32.NewProc("BitBlt")
+	getDIBits                = gdi32.NewProc("GetDIBits")
+	deleteObject             = gdi32.NewProc("DeleteObject")
+	deleteDC                 = gdi32.NewProc("DeleteDC")
+	setCursorPos             = user32.NewProc("SetCursorPos")
+	mouseEvent               = user32.NewProc("mouse_event")
+	sendInput                = user32.NewProc("SendInput")
+	openClipboard            = user32.NewProc("OpenClipboard")
+	closeClipboard           = user32.NewProc("CloseClipboard")
+	emptyClipboard           = user32.NewProc("EmptyClipboard")
+	getClipboardData         = user32.NewProc("GetClipboardData")
+	setClipboardData         = user32.NewProc("SetClipboardData")
+	globalAlloc              = kernel32.NewProc("GlobalAlloc")
+	globalLock               = kernel32.NewProc("GlobalLock")
+	globalUnlock             = kernel32.NewProc("GlobalUnlock")
+	globalFree               = kernel32.NewProc("GlobalFree")
+	globalSize               = kernel32.NewProc("GlobalSize")
+	getCurrentProcess        = kernel32.NewProc("GetCurrentProcess")
+	readProcessMemory        = kernel32.NewProc("ReadProcessMemory")
+	writeProcessMemory       = kernel32.NewProc("WriteProcessMemory")
+	enumWindows              = user32.NewProc("EnumWindows")
+	isWindowVisible          = user32.NewProc("IsWindowVisible")
+	getWindowText            = user32.NewProc("GetWindowTextW")
+	getForegroundWindow      = user32.NewProc("GetForegroundWindow")
+	getWindowThreadProcessID = user32.NewProc("GetWindowThreadProcessId")
+	getGUIThreadInfo         = user32.NewProc("GetGUIThreadInfo")
+	isChild                  = user32.NewProc("IsChild")
+	showWindow               = user32.NewProc("ShowWindow")
+	setForegroundWindow      = user32.NewProc("SetForegroundWindow")
+	shellExecute             = user32.NewProc("ShellExecuteW")
 )
 
 const (
@@ -98,12 +101,22 @@ type input struct {
 	Reserved [8]byte // INPUT's union is sized for MOUSEINPUT on 64-bit Windows.
 }
 
+type guiThreadInfo struct {
+	Size                                               uint32
+	Flags                                              uint32
+	Active, Focus, Capture, MenuOwner, MoveSize, Caret uintptr
+	CaretRect                                          struct{ Left, Top, Right, Bottom int32 }
+}
+
 type windowsDriver struct{}
 
 func NewDesktop() Desktop { return windowsDriver{} }
 
 func (windowsDriver) Available() map[string]bool {
-	return map[string]bool{"screen.capture": true, "pointer.move": true, "pointer.click": true, "keyboard.type": true, "keyboard.key": true, "clipboard.read": true, "clipboard.write": true, "window.list": true, "window.focus": true, "browser.navigate": true}
+	uia := uiaAvailable()
+	return map[string]bool{"screen.capture": true, "pointer.move": true, "pointer.click": true, "keyboard.type": true, "keyboard.key": true, "clipboard.read": true, "clipboard.write": true, "window.list": true, "browser.status": true, "window.focus": true,
+		"ui.inspect": uia, "ui.focus": uia, "ui.invoke": uia,
+		"browser.navigate": false, "browser.snapshot": false, "browser.query": false, "browser.click": false, "browser.fill": false, "browser.select": false, "browser.tabs": false, "browser.back": false, "browser.screenshot": false}
 }
 
 func (windowsDriver) Capture(ctx context.Context) (image.Image, Display, error) {
@@ -203,53 +216,148 @@ func sendUnicode(r rune) error {
 }
 
 func (windowsDriver) Type(ctx context.Context, text string) error {
-	for _, r := range text {
+	return fmt.Errorf("keyboard input requires worker focus authorization")
+}
+
+func resolveWindowThreadID(hwnd uintptr, call func(uintptr, *uint32) uintptr) (uintptr, error) {
+	var processID uint32
+	threadID := call(hwnd, &processID)
+	if threadID == 0 {
+		return 0, fmt.Errorf("foreground thread unavailable")
+	}
+	return threadID, nil
+}
+
+func focusedControl(ctx context.Context, expected uintptr) (uintptr, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	top, _, _ := getForegroundWindow.Call()
+	if top == 0 || top != expected || !(windowsDriver{}).ValidateWindow(ctx, fmt.Sprintf("0x%X", top)) {
+		return 0, fmt.Errorf("authorized window is not current foreground")
+	}
+	threadID, err := resolveWindowThreadID(top, func(hwnd uintptr, processID *uint32) uintptr {
+		r, _, _ := getWindowThreadProcessID.Call(hwnd, uintptr(unsafe.Pointer(processID)))
+		return r
+	})
+	if err != nil {
+		return 0, err
+	}
+	info := guiThreadInfo{Size: uint32(unsafe.Sizeof(guiThreadInfo{}))}
+	if r, _, _ := getGUIThreadInfo.Call(threadID, uintptr(unsafe.Pointer(&info))); r == 0 || !focusBelongsTo(top, info.Active, info.Focus, func(parent, child uintptr) bool { result, _, _ := isChild.Call(parent, child); return result != 0 }) {
+		return 0, fmt.Errorf("focused child is outside authorized window")
+	}
+	return info.Focus, nil
+}
+
+func focusBelongsTo(top, active, focus uintptr, childOf func(uintptr, uintptr) bool) bool {
+	return top != 0 && active != 0 && focus != 0 && (active == top || childOf(top, active)) && (focus == top || childOf(top, focus))
+}
+func focusContinuous(expectedTop, expectedFocus, currentTop, currentFocus uintptr) bool {
+	return expectedTop != 0 && expectedFocus != 0 && expectedTop == currentTop && expectedFocus == currentFocus
+}
+
+func waitForWindowActivation(ctx context.Context, id string, target uintptr, validate func() bool, activate func(uintptr) bool, foreground func() uintptr, pause func(time.Duration), timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := sendUnicode(r); err != nil {
-			return err
+		if !validate() {
+			return fmt.Errorf("window became stale before activation")
 		}
+		accepted := activate(target)
+		if accepted && foreground() == target {
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("window activation denied or foreground postcondition not met")
+		}
+		pause(25 * time.Millisecond)
+	}
+}
+
+func authorizedHWND(id string) (uintptr, error) {
+	if len(id) < 3 || len(id) > 256 || !strings.HasPrefix(strings.ToLower(id), "0x") {
+		return 0, fmt.Errorf("invalid authorized window")
+	}
+	n, err := strconv.ParseUint(id[2:], 16, uintptrBits())
+	if err != nil || n == 0 {
+		return 0, fmt.Errorf("invalid authorized window")
+	}
+	return uintptr(n), nil
+}
+
+func (windowsDriver) TypeInWindow(ctx context.Context, id, text string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if text == "" || len(text) > 4096 {
+		return fmt.Errorf("invalid keyboard text")
+	}
+	hwnd, err := authorizedHWND(id)
+	if err != nil {
+		return err
+	}
+	focus, err := focusedControl(ctx, hwnd)
+	if err != nil {
+		return err
+	}
+	sequence := make([]input, 0, len([]rune(text))*2)
+	for _, r := range text {
+		for _, unit := range utf16.Encode([]rune{r}) {
+			sequence = append(sequence, input{Type: 1, Key: keyboardInput{Scan: unit, Flags: keyUnicode}}, input{Type: 1, Key: keyboardInput{Scan: unit, Flags: keyUnicode | keyUp}})
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	activeFocus, err := focusedControl(ctx, hwnd)
+	active, _, _ := getForegroundWindow.Call()
+	if err != nil || !focusContinuous(hwnd, focus, active, activeFocus) {
+		return fmt.Errorf("authorized focus changed before keyboard input")
+	}
+	if n, _, _ := sendInput.Call(uintptr(len(sequence)), uintptr(unsafe.Pointer(&sequence[0])), unsafe.Sizeof(sequence[0])); n != uintptr(len(sequence)) {
+		return fmt.Errorf("keyboard input failed")
 	}
 	return nil
 }
 
 func (windowsDriver) Key(ctx context.Context, key string, modifiers []string) error {
-	codes := map[string]uint16{"enter": 0x0d, "tab": 0x09, "escape": 0x1b, "space": 0x20, "backspace": 0x08, "delete": 0x2e, "left": 0x25, "up": 0x26, "right": 0x27, "down": 0x28, "home": 0x24, "end": 0x23, "pageup": 0x21, "pagedown": 0x22, "shift": 0x10, "ctrl": 0x11, "alt": 0x12}
-	key = strings.ToLower(key)
-	if len(key) == 1 {
-		if key[0] >= 'a' && key[0] <= 'z' {
-			codes[key] = uint16(key[0] - 'a' + 'A')
-		}
-		if key[0] >= '0' && key[0] <= '9' {
-			codes[key] = uint16(key[0])
-		}
-	}
-	for i := 1; i <= 12; i++ {
-		codes["f"+strconv.Itoa(i)] = uint16(0x70 + i - 1)
-	}
-	code, ok := codes[key]
-	if !ok {
-		return fmt.Errorf("unsupported key")
-	}
-	mods := map[string]uint16{"shift": 0x10, "ctrl": 0x11, "control": 0x11, "alt": 0x12}
-	var sequence []input
-	for _, m := range modifiers {
-		vk, ok := mods[strings.ToLower(m)]
-		if !ok {
-			return fmt.Errorf("unsupported modifier")
-		}
-		sequence = append(sequence, input{Type: 1, Key: keyboardInput{VirtualKey: vk}})
-	}
-	sequence = append(sequence, input{Type: 1, Key: keyboardInput{VirtualKey: code}}, input{Type: 1, Key: keyboardInput{VirtualKey: code, Flags: keyUp}})
-	for i := len(modifiers) - 1; i >= 0; i-- {
-		vk := mods[strings.ToLower(modifiers[i])]
-		sequence = append(sequence, input{Type: 1, Key: keyboardInput{VirtualKey: vk, Flags: keyUp}})
-	}
+	return fmt.Errorf("keyboard input requires worker focus authorization")
+}
+
+func (windowsDriver) KeyInWindow(ctx context.Context, id, key string, modifiers []string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if n, _, _ := sendInput.Call(uintptr(len(sequence)), uintptr(unsafe.Pointer(&sequence[0])), unsafe.Sizeof(input{})); n != uintptr(len(sequence)) {
+	if len(modifiers) != 0 {
+		return fmt.Errorf("modifiers are not supported by the chat-orchestrator profile")
+	}
+	codes := map[string]uint16{"ENTER": 0x0d, "TAB": 0x09, "ESC": 0x1b, "SPACE": 0x20, "BACKSPACE": 0x08, "DELETE": 0x2e,
+		"ARROW_LEFT": 0x25, "ARROW_UP": 0x26, "ARROW_RIGHT": 0x27, "ARROW_DOWN": 0x28, "HOME": 0x24, "END": 0x23}
+	code, ok := codes[key]
+	if !ok {
+		return fmt.Errorf("unsupported chat-orchestrator key")
+	}
+	hwnd, err := authorizedHWND(id)
+	if err != nil {
+		return err
+	}
+	focus, err := focusedControl(ctx, hwnd)
+	if err != nil {
+		return err
+	}
+	pair := [2]input{{Type: 1, Key: keyboardInput{VirtualKey: code}}, {Type: 1, Key: keyboardInput{VirtualKey: code, Flags: keyUp}}}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	activeFocus, err := focusedControl(ctx, hwnd)
+	active, _, _ := getForegroundWindow.Call()
+	if err != nil || !focusContinuous(hwnd, focus, active, activeFocus) {
+		return fmt.Errorf("authorized focus changed before keyboard input")
+	}
+	if n, _, _ := sendInput.Call(2, uintptr(unsafe.Pointer(&pair[0])), unsafe.Sizeof(pair[0])); n != 2 {
 		return fmt.Errorf("keyboard input failed")
 	}
 	return nil
@@ -284,16 +392,15 @@ func (windowsDriver) Focus(ctx context.Context, id string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if len(id) < 3 || len(id) > 256 || !(windowsDriver{}).ValidateWindow(ctx, id) {
+		return fmt.Errorf("window is stale or not a current top-level window")
+	}
 	n, err := strconv.ParseUint(strings.TrimPrefix(strings.ToLower(id), "0x"), 16, uintptrBits())
 	if err != nil || n == 0 {
 		return fmt.Errorf("invalid window id")
 	}
 	showWindow.Call(uintptr(n), 9)
-	r, _, _ := setForegroundWindow.Call(uintptr(n))
-	if r == 0 {
-		return fmt.Errorf("window focus failed")
-	}
-	return nil
+	return waitForWindowActivation(ctx, id, uintptr(n), func() bool { return (windowsDriver{}).ValidateWindow(ctx, id) }, func(target uintptr) bool { r, _, _ := setForegroundWindow.Call(target); return r != 0 }, func() uintptr { active, _, _ := getForegroundWindow.Call(); return active }, time.Sleep, 350*time.Millisecond)
 }
 
 func uintptrBits() int { return int(unsafe.Sizeof(uintptr(0)) * 8) }

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Registered-Agent-Attorney/LASO-Computer/internal/capabilities"
+	"github.com/Registered-Agent-Attorney/LASO-Computer/internal/catalog"
 )
 
 const ProtocolVersion = 1
@@ -25,6 +26,8 @@ const (
 	maxActiveJobs     = 64
 	maxRetainedJobs   = 64
 	keepCompletedJobs = 32
+	maxResultBytes    = (1 << 20) - 4096
+	maxJobDuration    = 24 * time.Hour
 )
 
 type Request struct {
@@ -55,11 +58,13 @@ type Hello struct {
 }
 
 type CapabilityStatus struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	Risk        string `json:"risk"`
-	Available   bool   `json:"available"`
-	Decision    string `json:"decision"`
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	Risk        string          `json:"risk"`
+	Profile     string          `json:"profile,omitempty"`
+	InputSchema json.RawMessage `json:"input_schema,omitempty"`
+	Available   bool            `json:"available"`
+	Decision    string          `json:"decision"`
 }
 
 type Replay struct {
@@ -100,6 +105,9 @@ func NewEngine(root context.Context, executor *capabilities.Executor, hello Hell
 }
 
 func DecodeRequest(data []byte) (Request, error) {
+	if err := ValidateUniqueJSONKeys(data); err != nil {
+		return Request{}, fmt.Errorf("malformed request")
+	}
 	var req Request
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
@@ -116,6 +124,73 @@ func DecodeRequest(data []byte) (Request, error) {
 		return Request{}, fmt.Errorf("request exceeds size limit")
 	}
 	return req, nil
+}
+
+// ValidateUniqueJSONKeys rejects duplicate object keys at every nesting level.
+// encoding/json otherwise accepts duplicates and silently keeps the last value,
+// which can make policy and protocol validation disagree across implementations.
+func ValidateUniqueJSONKeys(data []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	var value func() error
+	value = func() error {
+		tok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		delim, ok := tok.(json.Delim)
+		if !ok {
+			return nil
+		}
+		switch delim {
+		case '{':
+			keys := make(map[string]struct{})
+			for dec.More() {
+				keyToken, err := dec.Token()
+				if err != nil {
+					return err
+				}
+				key, ok := keyToken.(string)
+				if !ok {
+					return fmt.Errorf("invalid JSON object key")
+				}
+				if _, exists := keys[key]; exists {
+					return fmt.Errorf("duplicate JSON object key")
+				}
+				keys[key] = struct{}{}
+				if err := value(); err != nil {
+					return err
+				}
+			}
+			end, err := dec.Token()
+			if err != nil || end != json.Delim('}') {
+				return fmt.Errorf("malformed JSON object")
+			}
+		case '[':
+			for dec.More() {
+				if err := value(); err != nil {
+					return err
+				}
+			}
+			end, err := dec.Token()
+			if err != nil || end != json.Delim(']') {
+				return fmt.Errorf("malformed JSON array")
+			}
+		default:
+			return fmt.Errorf("unexpected JSON delimiter")
+		}
+		return nil
+	}
+	if err := value(); err != nil {
+		return err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("trailing JSON value")
+		}
+		return err
+	}
+	return nil
 }
 
 var wireID = regexp.MustCompile(`^[A-Za-z0-9._:/-]{1,128}$`)
@@ -169,7 +244,31 @@ func (e *Engine) handleUnique(req Request) Response {
 		if err != nil {
 			return fail(req.RequestID, "capability discovery failed")
 		}
-		return ok(req.RequestID, "Completed", payload, "")
+		capabilities := make([]string, 0, len(e.hello.Capabilities))
+		for _, capability := range e.hello.Capabilities {
+			if capability.Available {
+				capabilities = append(capabilities, capability.Name)
+			}
+		}
+		metadata := map[string]any{
+			"id":                    "laso-computer",
+			"name":                  "LASO Computer",
+			"version":               "1",
+			"description":           "Local computer-use worker with user-controlled capability policy",
+			"capabilities":          capabilities,
+			"capability_profiles":   catalog.ProfileDescriptors(),
+			"supports_status":       true,
+			"supports_recovery":     false,
+			"supports_cancellation": true,
+			"computer": map[string]any{
+				"client_id":         e.hello.ClientID,
+				"os":                e.hello.OS,
+				"architecture":      e.hello.Architecture,
+				"capability_status": e.hello.Capabilities,
+			},
+		}
+		return Response{ProtocolVersion: ProtocolVersion, RequestID: req.RequestID, OK: true,
+			State: "Completed", Payload: payload, Metadata: metadata}
 	case "submit":
 		return e.submit(req)
 	case "status":
@@ -185,10 +284,32 @@ func (e *Engine) handleUnique(req Request) Response {
 	}
 }
 
+// toolPayload accepts both the original Computer v1 payload and the current
+// LASO WorkerRequest envelope. Keeping both shapes lets already-deployed local
+// process integrations continue to work while the Core envelope is validated
+// and translated into the same guarded local capability invocation.
 type toolPayload struct {
-	Capability string                 `json:"capability"`
-	Arguments  json.RawMessage        `json:"arguments"`
-	Principal  capabilities.Principal `json:"principal"`
+	JobID            string                 `json:"job_id,omitempty"`
+	WorkerID         string                 `json:"worker_id,omitempty"`
+	Capability       string                 `json:"capability"`
+	TaskType         string                 `json:"task_type,omitempty"`
+	Instructions     string                 `json:"instructions,omitempty"`
+	Deadline         string                 `json:"deadline,omitempty"`
+	IdempotencyKey   string                 `json:"idempotency_key,omitempty"`
+	RunID            string                 `json:"run_id,omitempty"`
+	NodeID           string                 `json:"node_id,omitempty"`
+	Attempt          uint                   `json:"attempt,omitempty"`
+	TimeoutMS        uint64                 `json:"timeout_ms,omitempty"`
+	Input            json.RawMessage        `json:"input,omitempty"`
+	OutputSchema     json.RawMessage        `json:"output_schema,omitempty"`
+	Metadata         json.RawMessage        `json:"metadata,omitempty"`
+	ArtifactIDs      []string               `json:"artifact_ids,omitempty"`
+	DurableSession   bool                   `json:"durable_session,omitempty"`
+	DurableSessionID string                 `json:"durable_session_id,omitempty"`
+	Continuation     json.RawMessage        `json:"continuation,omitempty"`
+	SessionContext   json.RawMessage        `json:"session_context,omitempty"`
+	Arguments        json.RawMessage        `json:"arguments,omitempty"`
+	Principal        capabilities.Principal `json:"principal,omitempty"`
 }
 
 func (e *Engine) submit(req Request) Response {
@@ -204,11 +325,51 @@ func (e *Engine) submit(req Request) Response {
 	if dec.Decode(new(any)) != io.EOF {
 		return fail(req.RequestID, "invalid capability request")
 	}
+	if payload.JobID != "" && payload.JobID != req.JobID {
+		return fail(req.RequestID, "job identity mismatch")
+	}
 	if payload.Principal.JobID != "" && payload.Principal.JobID != req.JobID {
 		return fail(req.RequestID, "job identity mismatch")
 	}
+	if len(payload.Arguments) > 0 && len(payload.Input) > 0 {
+		return fail(req.RequestID, "capability arguments are ambiguous")
+	}
+	if len(payload.Instructions) > 1<<20 || len(payload.Deadline) > 128 ||
+		len(payload.IdempotencyKey) > 128 || len(payload.RunID) > 128 || len(payload.NodeID) > 128 ||
+		len(payload.WorkerID) > 128 || len(payload.TaskType) > 128 || len(payload.DurableSessionID) > 128 ||
+		len(payload.OutputSchema) > 64*1024 || len(payload.Metadata) > 64*1024 ||
+		len(payload.Continuation) > 64*1024 || len(payload.SessionContext) > 1<<20 ||
+		len(payload.ArtifactIDs) > 256 {
+		return fail(req.RequestID, "capability request exceeds size limit")
+	}
+	for _, artifactID := range payload.ArtifactIDs {
+		if len(artifactID) == 0 || len(artifactID) > 128 || !wireID.MatchString(artifactID) {
+			return fail(req.RequestID, "invalid capability request")
+		}
+	}
+	if payload.TimeoutMS > uint64(maxJobDuration/time.Millisecond) {
+		return fail(req.RequestID, "capability timeout exceeds limit")
+	}
 	payload.Principal.JobID = req.JobID
+	if payload.Principal.SessionID == "" {
+		payload.Principal.SessionID = payload.DurableSessionID
+	}
+	arguments := payload.Arguments
+	if len(arguments) == 0 && len(payload.Input) > 0 {
+		// Core's input is the task context, which can contain a prompt unrelated
+		// to the capability's typed arguments. These read-only status probes take
+		// no arguments, so do not pass task text into their strict empty schemas.
+		switch payload.Capability {
+		case "browser.status", "window.list":
+			arguments = json.RawMessage(`{}`)
+		default:
+			arguments = payload.Input
+		}
+	}
 	if len(payload.Arguments) > 1<<20 {
+		return fail(req.RequestID, "request exceeds size limit")
+	}
+	if len(arguments) > 1<<20 {
 		return fail(req.RequestID, "request exceeds size limit")
 	}
 
@@ -243,7 +404,13 @@ func (e *Engine) submit(req Request) Response {
 		e.mu.Unlock()
 		return fail(req.RequestID, "completed job retention limit reached")
 	}
-	ctx, cancel := context.WithCancel(e.root)
+	var ctx context.Context
+	var cancel context.CancelFunc
+	if payload.TimeoutMS == 0 {
+		ctx, cancel = context.WithCancel(e.root)
+	} else {
+		ctx, cancel = context.WithTimeout(e.root, time.Duration(payload.TimeoutMS)*time.Millisecond)
+	}
 	externalID, err := randomID()
 	if err != nil {
 		cancel()
@@ -256,7 +423,7 @@ func (e *Engine) submit(req Request) Response {
 	e.jobByLASOID[req.JobID] = externalID
 	e.mu.Unlock()
 	payload.Principal.ExternalJobID = externalID
-	go e.run(ctx, job, capabilities.Invocation{RequestID: req.RequestID, Capability: payload.Capability, Arguments: payload.Arguments, Principal: payload.Principal})
+	go e.run(ctx, job, capabilities.Invocation{RequestID: req.RequestID, Capability: payload.Capability, Arguments: arguments, Principal: payload.Principal})
 	return Response{ProtocolVersion: ProtocolVersion, RequestID: req.RequestID, OK: true, State: "Running", ExternalJobID: externalID, Metadata: map[string]any{"job_id": req.JobID}}
 }
 
@@ -287,6 +454,17 @@ func (e *Engine) pruneJobsLocked() {
 
 func (e *Engine) run(ctx context.Context, job *Job, call capabilities.Invocation) {
 	result, err := e.executor.Invoke(ctx, call)
+	// A handler can return a value after ignoring cooperative cancellation. Such
+	// a value no longer belongs to a live action and must not be exposed as a
+	// successful completion.
+	if ctx.Err() != nil {
+		result = nil
+		err = ctx.Err()
+	}
+	if err == nil && len(result) > maxResultBytes {
+		result = nil
+		err = errors.New("result exceeds size limit")
+	}
 	job.mu.Lock()
 	if err == nil {
 		job.State = "Completed"
@@ -330,7 +508,12 @@ func (e *Engine) lookup(req Request) (*Job, Response, bool) {
 	job := e.jobs[req.ExternalJobID]
 	e.mu.Unlock()
 	if job == nil {
-		return nil, fail(req.RequestID, "job not found"), false
+		unknown := Response{ProtocolVersion: ProtocolVersion, RequestID: req.RequestID, OK: true,
+			State: "Unknown", ExternalJobID: req.ExternalJobID, Error: "job not found"}
+		if req.Operation == "cancel" {
+			unknown.Payload = json.RawMessage(`{"acknowledged":false}`)
+		}
+		return nil, unknown, false
 	}
 	return job, Response{}, true
 }
@@ -349,7 +532,7 @@ func (e *Engine) inspect(req Request, result bool) Response {
 	if state == "Running" {
 		return Response{ProtocolVersion: ProtocolVersion, RequestID: req.RequestID, OK: true, State: state, ExternalJobID: job.ID}
 	}
-	out := Response{ProtocolVersion: ProtocolVersion, RequestID: req.RequestID, OK: state == "Completed", State: state, ExternalJobID: job.ID, Payload: payload, Error: errText}
+	out := Response{ProtocolVersion: ProtocolVersion, RequestID: req.RequestID, OK: true, State: state, ExternalJobID: job.ID, Payload: payload, Error: errText}
 	return out
 }
 
@@ -366,7 +549,8 @@ func (e *Engine) cancel(req Request) Response {
 	job.mu.RLock()
 	state := job.State
 	job.mu.RUnlock()
-	return Response{ProtocolVersion: ProtocolVersion, RequestID: req.RequestID, OK: true, State: state, ExternalJobID: job.ID, Payload: json.RawMessage(`{"cancellation_requested":true}`)}
+	return Response{ProtocolVersion: ProtocolVersion, RequestID: req.RequestID, OK: true, State: state,
+		ExternalJobID: job.ID, Payload: json.RawMessage(fmt.Sprintf(`{"acknowledged":%t}`, state == "Cancelled"))}
 }
 
 func (e *Engine) shutdown(req Request) Response {
@@ -397,6 +581,29 @@ func (e *Engine) Close() {
 		job.Cancel()
 	}
 	e.mu.Unlock()
+}
+
+// CloseIfIdle prevents new requests only after all submitted capability jobs
+// have finished. It deliberately does not cancel active work, allowing a
+// supervisor to reject a restart request without interrupting a capability.
+func (e *Engine) CloseIfIdle() bool {
+	e.handleMu.Lock()
+	defer e.handleMu.Unlock()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return false
+	}
+	for _, job := range e.jobs {
+		job.mu.RLock()
+		running := job.State == "Running"
+		job.mu.RUnlock()
+		if running {
+			return false
+		}
+	}
+	e.closed = true
+	return true
 }
 
 func ok(id, state string, payload json.RawMessage, external string) Response {
